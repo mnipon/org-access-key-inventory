@@ -1,0 +1,56 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Read-only IAM role that lets the org-wide access-key inventory Lambda (running
+  in the management account) enumerate IAM access keys in this account. Deploy
+  either via a service-managed StackSet (auto-applied org-wide) or standalone in
+  a single account. No account IDs are hardcoded -- all values are parameters.
+
+Parameters:
+  RoleName:
+    Type: String
+    Default: OrgAccessKeyAuditRole
+    Description: Must match a name in the Lambda's CANDIDATE_ROLES list.
+  TrustedAccountId:
+    Type: String
+    AllowedPattern: "^[0-9]{12}$"
+    Description: >
+      Account ID that hosts the inventory Lambda (your management or audit
+      account). Supplied at deploy time -- never hardcoded in this template.
+  OrgId:
+    Type: String
+    AllowedPattern: "^o-[a-z0-9]{10,32}$"
+    Description: >
+      Your AWS Organizations ID (o-xxxx). Used as an aws:PrincipalOrgID
+      condition so only principals from your org can assume this role.
+
+Resources:
+  AuditRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: Read-only access for org-wide IAM access-key inventory.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${TrustedAccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrgId
+      Policies:
+        - PolicyName: read-access-keys
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:ListUsers
+                  - iam:ListAccessKeys
+                  - iam:GetAccessKeyLastUsed
+                Resource: "*"
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt AuditRole.Arn

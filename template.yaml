@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Org-wide IAM access key inventory. A Lambda in the management account
+  enumerates all org accounts, assumes a read role in each, lists IAM access
+  keys, and writes a consolidated CSV to an encrypted S3 bucket. Optional
+  scheduled execution.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: access-key-reports
+    Description: S3 key prefix for reports.
+  CandidateRoles:
+    Type: CommaDelimitedList
+    Default: OrgAccessKeyAuditRole,OrganizationAccountAccessRole,AWSControlTowerExecution
+    Description: >
+      Role names to try (in order) when assuming into a member account. The
+      Lambda uses the first one it can assume. If you add a custom name here,
+      also add its ARN to the AssumeMemberRoles policy statement below.
+  EnableSchedule:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Run the inventory on a recurring schedule.
+  ScheduleExpression:
+    Type: String
+    Default: rate(1 day)
+    Description: EventBridge schedule expression (used only if EnableSchedule=true).
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Email address to notify when the inventory hits errors that need an
+      administrator. If left blank, NO SNS topic, subscription, or alarms are
+      created at all (error details still appear in the return payload and
+      CloudWatch logs). If set, AWS emails a one-time subscription confirmation
+      that you MUST click before any alerts can be delivered.
+  MaskHead:
+    Type: Number
+    Default: 4
+    Description: Number of leading characters of the access key id to keep visible.
+  MaskTail:
+    Type: Number
+    Default: 4
+    Description: >
+      Number of trailing characters to keep visible. Set MaskHead and MaskTail
+      both to 0 to disable masking and show the full key id.
+
+Conditions:
+  DoSchedule: !Equals [!Ref EnableSchedule, "true"]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlertEmail
+    Properties:
+      DisplayName: Access-key inventory alerts
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: access-key-inventory
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DiscoverAccounts
+                Effect: Allow
+                Action: organizations:ListAccounts
+                Resource: "*"
+              - Sid: AssumeMemberRoles
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource:
+                  - arn:aws:iam::*:role/OrgAccessKeyAuditRole
+                  - arn:aws:iam::*:role/OrganizationAccountAccessRole
+                  - arn:aws:iam::*:role/AWSControlTowerExecution
+              - Sid: ReadLocalIamKeys
+                Effect: Allow
+                Action:
+                  - iam:ListUsers
+                  - iam:ListAccessKeys
+                  - iam:GetAccessKeyLastUsed
+                Resource: "*"
+              - Sid: WriteReport
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${ReportBucket.Arn}/*"
+              - !If
+                - HasAlertEmail
+                - Sid: PublishAlerts
+                  Effect: Allow
+                  Action: sns:Publish
+                  Resource: !Ref AlertTopic
+                - !Ref AWS::NoValue
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-inventory"
+      RetentionInDays: 90
+
+  InventoryFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-inventory"
+      Description: Org-wide IAM access key inventory to S3 CSV
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt FunctionRole.Arn
+      Code: ./lambda
+      Environment:
+        Variables:
+          BUCKET: !Ref ReportBucket
+          PREFIX: !Ref Prefix
+          CANDIDATE_ROLES: !Join [",", !Ref CandidateRoles]
+          ALERT_TOPIC_ARN: !If [HasAlertEmail, !Ref AlertTopic, !Ref "AWS::NoValue"]
+          MASK_HEAD: !Ref MaskHead
+          MASK_TAIL: !Ref MaskTail
+
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: DoSchedule
+    Properties:
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt InventoryFunction.Arn
+          Id: inventory
+
+  SchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: DoSchedule
+    Properties:
+      FunctionName: !Ref InventoryFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+  # Alarm 1: the function itself crashed / timed out (Lambda Errors metric).
+  FunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlertEmail
+    Properties:
+      AlarmDescription: Inventory Lambda invocation failed (crash/timeout).
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref InventoryFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # Alarm 2: the function ran but one or more accounts could not be inventoried.
+  # Driven by a metric filter on the "ADMIN ACTION REQUIRED" log line.
+  AdminActionMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: HasAlertEmail
+    Properties:
+      LogGroupName: !Ref LogGroup
+      FilterPattern: '"ADMIN ACTION REQUIRED"'
+      MetricTransformations:
+        - MetricNamespace: OrgAccessKeyInventory
+          MetricName: AdminActionRequired
+          MetricValue: "1"
+          DefaultValue: 0
+
+  AdminActionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlertEmail
+    Properties:
+      AlarmDescription: One or more accounts could not be inventoried (needs admin).
+      Namespace: OrgAccessKeyInventory
+      MetricName: AdminActionRequired
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+Outputs:
+  BucketName:
+    Value: !Ref ReportBucket
+  FunctionName:
+    Value: !Ref InventoryFunction
+  AlertTopicArn:
+    Condition: HasAlertEmail
+    Value: !Ref AlertTopic
+  LogGroup:
+    Value: !Ref LogGroup
