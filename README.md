@@ -131,16 +131,6 @@ staleness threshold with `StaleAgeDays`.
 
 ---
 
-## Did anything fail?
-
-If an account can't be inventoried (missing role, SCP, suspended), it's reported
-three ways: the `errors[]` in the result, an `ADMIN ACTION REQUIRED` line in the
-Lambda's CloudWatch logs, and (if you set an email) an SNS alert. Fix: make sure
-`OrgAccessKeyAuditRole` exists there (re-run step 1, or have the owner deploy
-`member-audit-role.yaml`).
-
----
-
 ## Teardown
 
 Two parts to set up, two to tear down:
