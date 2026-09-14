@@ -17,6 +17,8 @@ schedule.
 - One consolidated CSV: `account_id, account_name, user, access_key_id, status, create_date, age_days, last_used`.
 - Key IDs are **masked** (e.g. `AKIA************MPLE`); secret keys are never touched.
 - Report stored in a private, encrypted, versioned S3 bucket.
+- **History tracking** — each run diffs against the previous one and records which keys were **added, removed, activated, or deactivated**, as a JSON changelog in S3.
+- **CloudWatch metrics + dashboard** — key counts, staleness, and run-to-run changes are published as custom metrics (namespace `OrgAccessKeyInventory`) so you get a time series of your org's key posture and a ready-made dashboard.
 
 ---
 
@@ -39,6 +41,7 @@ aws cloudformation activate-organizations-access --profile "$PROFILE"
 ```
 
 `deploy.sh` asks two optional questions:
+
 - **Alert email** — blank = no alerting; an address = SNS alerts on errors (you must click the confirmation email AWS sends).
 - **Schedule** — `N` = run on demand; or pick Daily / Weekly / Every 12h / Monthly / a specific day of month.
 
@@ -65,7 +68,66 @@ KEY=$(aws s3api list-objects-v2 --bucket "$BUCKET" \
 aws s3 cp "s3://$BUCKET/$KEY" ./report.csv --profile "$PROFILE" --region "$REGION" && cat report.csv
 ```
 
-The invoke result shows `status` (`OK` or `ATTENTION_REQUIRED`), counts, and the S3 path.
+The invoke result shows `status` (`OK` or `ATTENTION_REQUIRED`), counts, the S3
+path, a `metrics` block, and a `changes` block, for example:
+
+```json
+{
+  "status": "OK",
+  "keys_found": 42,
+  "metrics": {
+    "KeysTotal": 42,
+    "KeysActive": 30,
+    "KeysStale": 7,
+    "AccountsWithErrors": 0
+  },
+  "changes": {
+    "first_run": false,
+    "added": 1,
+    "removed": 2,
+    "activated": 0,
+    "deactivated": 1
+  },
+  "history_location": "s3://<bucket>/access-key-reports/history/2026/09/14/changes-...json"
+}
+```
+
+---
+
+## Metrics & history
+
+Every run publishes custom CloudWatch metrics (namespace `OrgAccessKeyInventory`)
+and updates a dashboard named `<stack>-access-keys`:
+
+| Metric                                                            | Meaning                                                                                  |
+| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `KeysTotal` / `KeysActive` / `KeysInactive`                       | Total keys and their status split.                                                       |
+| `KeysStale` / `KeysStaleActive`                                   | Keys at/above `StaleAgeDays` (default 90); the second counts only the still-active ones. |
+| `KeysNeverUsed`                                                   | Keys with no recorded last-used date.                                                    |
+| `AccountsScanned` / `AccountsWithErrors`                          | Coverage of the run.                                                                     |
+| `KeysAdded` / `KeysRemoved` / `KeysActivated` / `KeysDeactivated` | Changes since the previous run (history).                                                |
+
+The dashboard has a full-width **Current counts** strip (KeysTotal, KeysActive,
+KeysInactive, KeysNeverUsed, KeysStale, AccountsScanned, AccountsWithErrors) plus
+time-series widgets for status, rotation risk, history, and run health. Open it
+from the stack output:
+
+```bash
+aws cloudformation describe-stacks --stack-name org-access-key-inventory \
+  --profile "$PROFILE" --region "$REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='DashboardUrl'].OutputValue" --output text
+```
+
+> The single-value strip shows the latest datapoint **inside the selected time
+> range**. Use a relative range (1h/3h/1d) ending at "now" and refresh after a
+> run, or it may show an older value.
+
+The **history changelog** for each run (what changed and in which account) is
+written to `s3://<bucket>/access-key-reports/history/YYYY/MM/DD/changes-*.json`.
+The first run only records a baseline (no change metrics or changelog).
+
+Set `PublishMetrics=false` at deploy time to skip metrics/dashboard; tune the
+staleness threshold with `StaleAgeDays`.
 
 ---
 
@@ -92,11 +154,11 @@ Two parts to set up, two to tear down:
 
 ## Files
 
-| File | Purpose |
-|------|---------|
-| `template.yaml` | Main stack: Lambda, role, S3, optional SNS/alarms/schedule. |
-| `lambda/lambda_function.py` | The inventory handler. |
-| `deploy.sh` / `destroy.sh` | Deploy / remove the main stack. |
-| `member-audit-role.yaml` | Read-only role for member accounts. |
-| `deploy-audit-role-stackset.sh` / `destroy-audit-role-stackset.sh` | Deploy / remove that role org-wide. |
-| `README.detailed.md` | Full documentation. |
+| File                                                               | Purpose                                                     |
+| ------------------------------------------------------------------ | ----------------------------------------------------------- |
+| `template.yaml`                                                    | Main stack: Lambda, role, S3, optional SNS/alarms/schedule. |
+| `lambda/lambda_function.py`                                        | The inventory handler.                                      |
+| `deploy.sh` / `destroy.sh`                                         | Deploy / remove the main stack.                             |
+| `member-audit-role.yaml`                                           | Read-only role for member accounts.                         |
+| `deploy-audit-role-stackset.sh` / `destroy-audit-role-stackset.sh` | Deploy / remove that role org-wide.                         |
+| `README.detailed.md`                                               | Full documentation.                                         |

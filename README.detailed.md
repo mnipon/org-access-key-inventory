@@ -7,7 +7,7 @@ a CloudFormation StackSet.
 
 Each row includes the access key's **true creation date** and **last-used** info —
 data that org-level IAM Access Analyzer and AWS Config cannot give you (Config has
-no `AWS::IAM::AccessKey` resource type, and Access Analyzer only reports *unused*
+no `AWS::IAM::AccessKey` resource type, and Access Analyzer only reports _unused_
 keys). See [Why this exists](#why-this-exists).
 
 ---
@@ -26,10 +26,12 @@ keys). See [Why this exists](#why-this-exists).
                         │    3. iam:ListUsers / ListAccessKeys /        │  │
                         │       GetAccessKeyLastUsed                    │  │
                         │    4. write CSV → S3 (SSE, versioned)         │  │
-                        │    5. log RUN SUMMARY; alert on errors        │  │
+                        │    5. diff vs. prior state → history changelog│  │
+                        │    6. publish CloudWatch metrics              │  │
+                        │    7. log RUN SUMMARY; alert on errors        │  │
                         │                                               │  │
                         │  ReportBucket (S3)   AlertTopic (SNS)         │  │
-                        │  CloudWatch alarms + metric filter            │  │
+                        │  CloudWatch metrics + dashboard + alarms      │  │
                         └─────────────────────────────────────────────┘  │
                                                                           │ assume
    ┌──────────────────────────────────────────────────────────────────┐ │ OrgAccessKeyAuditRole
@@ -49,14 +51,14 @@ and uses the first it can assume. Any account it cannot reach is recorded as an
 
 ## Files
 
-| File | Purpose |
-|------|---------|
-| `lambda/lambda_function.py` | Lambda handler: fan-out, CSV build, S3 write, logging, SNS alert. |
-| `template.yaml` | Main stack: Lambda, IAM role, S3 bucket, SNS topic, alarms, optional schedule. |
-| `deploy.sh` | Package + deploy the main stack. |
-| `destroy.sh` | Delete the main stack (report bucket **retained** by design). |
-| `member-audit-role.yaml` | Parameterized read-only role for member accounts (StackSet or standalone). |
-| `deploy-audit-role-stackset.sh` | Deploy that role org-wide via a service-managed StackSet (IDs auto-discovered). |
+| File                             | Purpose                                                                           |
+| -------------------------------- | --------------------------------------------------------------------------------- |
+| `lambda/lambda_function.py`      | Lambda handler: fan-out, CSV build, S3 write, logging, SNS alert.                 |
+| `template.yaml`                  | Main stack: Lambda, IAM role, S3 bucket, SNS topic, alarms, optional schedule.    |
+| `deploy.sh`                      | Package + deploy the main stack.                                                  |
+| `destroy.sh`                     | Delete the main stack (report bucket **retained** by design).                     |
+| `member-audit-role.yaml`         | Parameterized read-only role for member accounts (StackSet or standalone).        |
+| `deploy-audit-role-stackset.sh`  | Deploy that role org-wide via a service-managed StackSet (IDs auto-discovered).   |
 | `destroy-audit-role-stackset.sh` | Remove that StackSet + roles from every member account (root ID auto-discovered). |
 
 > **No account IDs are hardcoded anywhere.** The management account ID, org ID,
@@ -79,7 +81,7 @@ and uses the first it can assume. Any account it cannot reach is recorded as an
 > Throughout this doc, `<mgmt-profile>` is your AWS CLI profile for the
 > Organizations **management account**. `<new-mgmt-profile>` (in
 > [Redeploy to another organization](#redeploy-to-another-organization)) is the
-> management-account profile of a *different* org.
+> management-account profile of a _different_ org.
 
 ---
 
@@ -101,7 +103,7 @@ REGION=us-east-1        # IAM is global; a single region is fine
 `deploy.sh` will prompt:
 
 ```
-Alert email address (optional): 
+Alert email address (optional):
 ```
 
 - **Leave blank** → the stack is deployed with **no SNS topic, no subscription,
@@ -177,12 +179,32 @@ Sample response:
   "accounts_scanned": 5,
   "keys_found": 4,
   "errors": [],
-  "s3_location": "s3://<bucket>/access-key-reports/2026/09/08/org-access-keys-20260908T063802Z.csv"
+  "s3_location": "s3://<bucket>/access-key-reports/2026/09/08/org-access-keys-20260908T063802Z.csv",
+  "metrics": {
+    "KeysTotal": 4,
+    "KeysActive": 3,
+    "KeysInactive": 1,
+    "KeysNeverUsed": 1,
+    "KeysStale": 2,
+    "KeysStaleActive": 1,
+    "AccountsScanned": 5,
+    "AccountsWithErrors": 0
+  },
+  "changes": {
+    "first_run": false,
+    "added": 1,
+    "removed": 0,
+    "activated": 0,
+    "deactivated": 1
+  },
+  "history_location": "s3://<bucket>/access-key-reports/history/2026/09/08/changes-20260908T063802Z.json"
 }
 ```
 
 `status` is `OK` when every account was inventoried, or `ATTENTION_REQUIRED` when
-one or more accounts failed (see below).
+one or more accounts failed (see below). `metrics` and `changes` mirror what is
+published to CloudWatch and recorded in the history changelog (see
+[Metrics & history](#metrics--history)).
 
 ### Download the latest report
 
@@ -202,15 +224,120 @@ cat report.csv
 
 ### CSV columns
 
-| Column | Meaning |
-|--------|---------|
-| `account_id`, `account_name` | Owning account. |
-| `user` | IAM user name. |
-| `access_key_id` | The `AKIA...` key ID, **masked** to first/last 4 chars (e.g. `AKIA************MPLE`). No secret is ever exposed. Tune with `MaskHead`/`MaskTail` (both `0` = show full id). |
-| `status` | `Active` / `Inactive`. |
-| `create_date` | **True key creation timestamp** (from `ListAccessKeys`). |
-| `age_days` | Age of the key in days (rotation signal). |
-| `last_used` | Last-used timestamp, or `N/A` if never used. |
+| Column                       | Meaning                                                                                                                                                                     |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `account_id`, `account_name` | Owning account.                                                                                                                                                             |
+| `user`                       | IAM user name.                                                                                                                                                              |
+| `access_key_id`              | The `AKIA...` key ID, **masked** to first/last 4 chars (e.g. `AKIA************MPLE`). No secret is ever exposed. Tune with `MaskHead`/`MaskTail` (both `0` = show full id). |
+| `status`                     | `Active` / `Inactive`.                                                                                                                                                      |
+| `create_date`                | **True key creation timestamp** (from `ListAccessKeys`).                                                                                                                    |
+| `age_days`                   | Age of the key in days (rotation signal).                                                                                                                                   |
+| `last_used`                  | Last-used timestamp, or `N/A` if never used.                                                                                                                                |
+
+---
+
+## Metrics & history
+
+Beyond the point-in-time CSV, each run turns the inventory into a **tracked time
+series** and a **run-to-run changelog**.
+
+### CloudWatch metrics
+
+After building the report, the Lambda publishes custom metrics to the namespace
+set by `MetricNamespace` (default `OrgAccessKeyInventory`) via
+`cloudwatch:PutMetricData`:
+
+| Metric                              | Stat to graph | Meaning                                                           |
+| ----------------------------------- | ------------- | ----------------------------------------------------------------- |
+| `KeysTotal`                         | Max           | All access keys across the org.                                   |
+| `KeysActive` / `KeysInactive`       | Max           | Status split.                                                     |
+| `KeysNeverUsed`                     | Max           | Keys with no last-used date (dormant).                            |
+| `KeysStale`                         | Max           | Keys aged ≥ `StaleAgeDays` (default 90) — rotation candidates.    |
+| `KeysStaleActive`                   | Max           | Stale keys that are **still Active** — the ones that matter most. |
+| `AccountsScanned`                   | Max           | Accounts inventoried in the run.                                  |
+| `AccountsWithErrors`                | Max           | Accounts that could not be inventoried.                           |
+| `KeysAdded` / `KeysRemoved`         | Sum           | Keys created / deleted since the previous run.                    |
+| `KeysActivated` / `KeysDeactivated` | Sum           | Keys whose status flipped since the previous run.                 |
+
+Metric publishing is best-effort: if it fails, the run still succeeds and the
+failure is logged. Disable it entirely with `PublishMetrics=false`.
+
+### Dashboard
+
+When `PublishMetrics=true` (the default), the stack creates a CloudWatch
+dashboard named `<stack>-access-keys` with these widgets:
+
+- **Current counts (latest run)** — a full-width single-value strip:
+  `KeysTotal`, `KeysActive`, `KeysInactive`, `KeysNeverUsed`, `KeysStale`,
+  `AccountsScanned`, `AccountsWithErrors`.
+- **Keys by status over time** — `KeysTotal`, `KeysActive`, `KeysInactive`,
+  `KeysNeverUsed`.
+- **Rotation risk** — `KeysStale`, `KeysStaleActive`, `KeysNeverUsed`.
+- **History: changes since previous run** — `KeysAdded`, `KeysRemoved`,
+  `KeysActivated`, `KeysDeactivated`.
+- **Run health** — Lambda `Invocations` and `Errors`.
+
+> The single-value strip shows the value of the **most recent datapoint within
+> the selected time range**, not a peak or a running total. Use a _relative_
+> range (e.g. 1h/3h/1d) that ends at "now" and refresh after a run, otherwise it
+> can display an older run's numbers.
+
+Grab the direct link from the stack outputs:
+
+```bash
+aws cloudformation describe-stacks --stack-name org-access-key-inventory \
+  --profile "$PROFILE" --region "$REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='DashboardUrl'].OutputValue" --output text
+```
+
+### History (change detection)
+
+To know _what changed_, the Lambda keeps a small state file at
+`s3://<bucket>/<prefix>/state/keys-state.json` — a map of **hashed** key
+identifiers (`sha256(account_id:access_key_id)`, so no raw key ID is persisted)
+to lightweight descriptors (account, user, masked key ID, status, create date).
+
+On each run it:
+
+1. Loads the previous state (absent on the first run → establishes a baseline).
+2. Diffs it against the current inventory to find added / removed / activated /
+   deactivated keys.
+3. Overwrites the state file with the current snapshot.
+4. If anything changed, writes a changelog to
+   `s3://<bucket>/<prefix>/history/YYYY/MM/DD/changes-<timestamp>.json`:
+
+```json
+{
+  "run_time": "2026-09-08T06:38:02+00:00",
+  "report": "s3://<bucket>/access-key-reports/2026/09/08/org-access-keys-20260908T063802Z.csv",
+  "counts": { "added": 1, "removed": 0, "activated": 0, "deactivated": 1 },
+  "changes": {
+    "added": [
+      {
+        "account_id": "…",
+        "user": "…",
+        "access_key_id": "AKIA****…****MPLE",
+        "status": "Active",
+        "create_date": "…"
+      }
+    ],
+    "removed": [],
+    "activated": [],
+    "deactivated": [
+      {
+        "account_id": "…",
+        "user": "…",
+        "access_key_id": "AKIA****…****MPLE",
+        "status": "Inactive",
+        "old_status": "Active"
+      }
+    ]
+  }
+}
+```
+
+The **first run** records only the baseline state — no changelog and no change
+metrics, since there is nothing to compare against yet.
 
 ---
 
@@ -248,11 +375,11 @@ attention**, three independent ways:
 An account shows up as an error when the Lambda cannot assume any role in
 `CANDIDATE_ROLES` there. Common causes and fixes:
 
-| Cause | Fix |
-|-------|-----|
+| Cause                                                                                                          | Fix                                                                                                                                             |
+| -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | Account has none of the candidate roles (e.g. an **invited** account with no `OrganizationAccountAccessRole`). | Deploy `OrgAccessKeyAuditRole` there — via the StackSet (auto for org members) or hand the owner `member-audit-role.yaml` to deploy standalone. |
-| An SCP denies `sts:AssumeRole` / IAM reads. | Adjust the SCP to allow the audit role. |
-| Account is suspended / being closed. | Usually safe to ignore. |
+| An SCP denies `sts:AssumeRole` / IAM reads.                                                                    | Adjust the SCP to allow the audit role.                                                                                                         |
+| Account is suspended / being closed.                                                                           | Usually safe to ignore.                                                                                                                         |
 
 ---
 
@@ -276,10 +403,10 @@ automatically.
 Setup has **two parts**, so teardown does too. Each `deploy` script has a
 matching `destroy` script that removes exactly what it created:
 
-| Script | Removes | Undeploys what `deploy` script created |
-|--------|---------|----------------------------------------|
-| `./destroy.sh` | The **main stack** in the management account: Lambda, its IAM role, S3 report bucket (retained), SNS/alarms, schedule. | `deploy.sh` |
-| `./destroy-audit-role-stackset.sh` | The **`OrgAccessKeyAuditRole`** in **every member account**, plus the StackSet itself. | `deploy-audit-role-stackset.sh` |
+| Script                             | Removes                                                                                                                | Undeploys what `deploy` script created |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------- |
+| `./destroy.sh`                     | The **main stack** in the management account: Lambda, its IAM role, S3 report bucket (retained), SNS/alarms, schedule. | `deploy.sh`                            |
+| `./destroy-audit-role-stackset.sh` | The **`OrgAccessKeyAuditRole`** in **every member account**, plus the StackSet itself.                                 | `deploy-audit-role-stackset.sh`        |
 
 Run whichever you need. To remove **everything**, run both (order doesn't matter):
 
@@ -314,8 +441,13 @@ aws s3 rb "s3://access-key-audit-artifacts-${ACCOUNT_ID}-${REGION}" --force --pr
 
 - The Lambda role is **least-privilege**: `organizations:ListAccounts`,
   `sts:AssumeRole` only on the three specific audit-role ARNs, read-only IAM in
-  the management account, `s3:PutObject` only to the report bucket, and
-  `sns:Publish` only to the alert topic.
+  the management account, `s3:PutObject`/`s3:GetObject` only on the report bucket
+  (the latter to read the small history state file), `cloudwatch:PutMetricData`
+  restricted to the `MetricNamespace` via an IAM condition, and `sns:Publish`
+  only to the alert topic.
+- The history state and changelog store **masked** key IDs and a one-way
+  `sha256` of `account_id:access_key_id` as the identifier — no raw key IDs and
+  never any secret keys.
 - The member-account role is **read-only** (`ListUsers`, `ListAccessKeys`,
   `GetAccessKeyLastUsed`) and trusts **only** the management account **and** only
   principals from your org (`aws:PrincipalOrgID` condition).
@@ -328,9 +460,9 @@ aws s3 rb "s3://access-key-audit-artifacts-${ACCOUNT_ID}-${REGION}" --force --pr
 
 ## Why this exists
 
-| Approach | Org-wide? | Creation date? | Key ID? | Notes |
-|----------|-----------|----------------|---------|-------|
-| **This solution** | ✅ | ✅ | ✅ | Complete inventory of *all* keys. |
-| IAM Access Analyzer – unused access | ✅ | ❌ | ❌ | Only *unused* keys; good for cleanup. |
-| AWS Config aggregator | ✅ | n/a | n/a | No `AWS::IAM::AccessKey` resource type. |
-| IAM credential report | ❌ (per-account) | proxy only | ❌ | `last_rotated` ≈ creation only if never rotated. |
+| Approach                            | Org-wide?        | Creation date? | Key ID? | Notes                                            |
+| ----------------------------------- | ---------------- | -------------- | ------- | ------------------------------------------------ |
+| **This solution**                   | ✅               | ✅             | ✅      | Complete inventory of _all_ keys.                |
+| IAM Access Analyzer – unused access | ✅               | ❌             | ❌      | Only _unused_ keys; good for cleanup.            |
+| AWS Config aggregator               | ✅               | n/a            | n/a     | No `AWS::IAM::AccessKey` resource type.          |
+| IAM credential report               | ❌ (per-account) | proxy only     | ❌      | `last_rotated` ≈ creation only if never rotated. |

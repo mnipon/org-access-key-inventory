@@ -12,6 +12,17 @@ Observability:
     is published so an administrator is actively notified.
   * The returned payload includes "status": "OK" | "ATTENTION_REQUIRED".
 
+Metrics & history:
+  * After each run, aggregate counts (total/active/inactive/stale/never-used
+    keys, accounts scanned, accounts with errors) are published to CloudWatch as
+    custom metrics under METRIC_NAMESPACE, so you get a time series of your
+    org's key posture and can build alarms/dashboards on it.
+  * The run also diffs against the previous run's state (a small JSON kept in S3)
+    to detect keys ADDED, REMOVED, ACTIVATED, and DEACTIVATED since last time.
+    Those change counts are emitted as metrics too, and a per-run changelog is
+    written to S3 (PREFIX/history/...). This turns isolated snapshots into a
+    tracked history of what changed and when.
+
 Environment variables:
   BUCKET           (required)  destination S3 bucket
   PREFIX           (optional)  key prefix, default "access-key-reports"
@@ -19,16 +30,24 @@ Environment variables:
                                assuming into a member account. Default:
                                "OrgAccessKeyAuditRole,OrganizationAccountAccessRole,AWSControlTowerExecution"
   ALERT_TOPIC_ARN  (optional)  SNS topic ARN to notify when errors occur.
+  METRIC_NAMESPACE (optional)  CloudWatch namespace for custom metrics.
+                               Default "OrgAccessKeyInventory".
+  STALE_AGE_DAYS   (optional)  Age (days) at/above which a key counts as "stale"
+                               and needs rotation. Default 90.
+  PUBLISH_METRICS  (optional)  "true"/"false" to enable/disable CloudWatch metric
+                               publishing. Default "true".
 """
 import csv
 import datetime as dt
+import hashlib
 import io
+import json
 import logging
 import os
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -38,6 +57,12 @@ _DEFAULT_ROLES = "OrgAccessKeyAuditRole,OrganizationAccountAccessRole,AWSControl
 CANDIDATE_ROLES = [r.strip() for r in os.environ.get("CANDIDATE_ROLES", _DEFAULT_ROLES).split(",") if r.strip()]
 FIELDS = ["account_id", "account_name", "user", "access_key_id",
           "status", "create_date", "age_days", "last_used"]
+
+METRIC_NAMESPACE = os.environ.get("METRIC_NAMESPACE", "OrgAccessKeyInventory")
+STALE_AGE_DAYS = int(os.environ.get("STALE_AGE_DAYS", "90"))
+PUBLISH_METRICS = os.environ.get("PUBLISH_METRICS", "true").lower() != "false"
+# Where the "last run" state used for change detection lives (relative to PREFIX).
+STATE_SUFFIX = "state/keys-state.json"
 
 # Show only the first/last few characters of an access key id (e.g. keep 4 at
 # each end, mask the middle). Controlled by MASK_HEAD / MASK_TAIL env vars
@@ -66,11 +91,14 @@ def _collect_keys(iam, now):
                     lu = iam.get_access_key_last_used(AccessKeyId=kid)["AccessKeyLastUsed"]
                     if "LastUsedDate" in lu:
                         last_used = lu["LastUsedDate"].isoformat()
-                except ClientError:
+                except (ClientError, BotoCoreError):
                     pass
                 rows.append({
                     "user": name,
                     "access_key_id": _mask(kid),
+                    # Kept only in-memory for change detection; never written to
+                    # the CSV (not in FIELDS) nor to the S3 state file (hashed).
+                    "raw_key_id": kid,
                     "status": k["Status"],
                     "create_date": k["CreateDate"].isoformat(),
                     "age_days": (now - k["CreateDate"]).days,
@@ -121,6 +149,109 @@ def _notify(errors, summary):
         logger.error("Failed to publish SNS alert: %s", e)
 
 
+def _summarize(rows, accounts_scanned, error_count):
+    """Aggregate the raw rows into the counts we track over time."""
+    total = len(rows)
+    active = sum(1 for r in rows if r["status"] == "Active")
+    never_used = sum(1 for r in rows if r["last_used"] == "N/A")
+    stale = sum(1 for r in rows if r["age_days"] >= STALE_AGE_DAYS)
+    stale_active = sum(1 for r in rows
+                       if r["age_days"] >= STALE_AGE_DAYS and r["status"] == "Active")
+    return {
+        "KeysTotal": total,
+        "KeysActive": active,
+        "KeysInactive": total - active,
+        "KeysNeverUsed": never_used,
+        "KeysStale": stale,
+        "KeysStaleActive": stale_active,
+        "AccountsScanned": accounts_scanned,
+        "AccountsWithErrors": error_count,
+    }
+
+
+def _state_id(account_id, raw_key_id):
+    """Stable, non-reversible identifier for a key (no raw id is persisted)."""
+    return hashlib.sha256(f"{account_id}:{raw_key_id}".encode("utf-8")).hexdigest()
+
+
+def _build_state(rows):
+    """Map of hashed-key-id -> lightweight descriptor, for run-to-run diffing."""
+    state = {}
+    for r in rows:
+        state[_state_id(r["account_id"], r["raw_key_id"])] = {
+            "account_id": r["account_id"],
+            "account_name": r["account_name"],
+            "user": r["user"],
+            "access_key_id": r["access_key_id"],  # already masked
+            "status": r["status"],
+            "create_date": r["create_date"],
+        }
+    return state
+
+
+def _load_state(s3, bucket, key):
+    """Load the previous run's state, or {} if this is the first run."""
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        return json.loads(obj["Body"].read().decode("utf-8"))
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("NoSuchKey", "NoSuchBucket", "404"):
+            return {}
+        logger.warning("Could not load previous state (%s); treating as first run",
+                       e.response["Error"]["Code"])
+        return {}
+    except (ValueError, KeyError):
+        logger.warning("Previous state was unreadable; treating as first run")
+        return {}
+
+
+def _diff_states(prev, curr):
+    """Compute added / removed / status-changed keys between two runs."""
+    added = [curr[k] for k in curr if k not in prev]
+    removed = [prev[k] for k in prev if k not in curr]
+    activated, deactivated = [], []
+    for k in curr:
+        if k in prev and prev[k].get("status") != curr[k].get("status"):
+            entry = {**curr[k], "old_status": prev[k].get("status")}
+            if curr[k].get("status") == "Active":
+                activated.append(entry)
+            else:
+                deactivated.append(entry)
+    return {
+        "added": added,
+        "removed": removed,
+        "activated": activated,
+        "deactivated": deactivated,
+    }
+
+
+def _publish_metrics(counts, changes, first_run):
+    """Publish aggregate + change counts to CloudWatch as custom metrics."""
+    if not PUBLISH_METRICS:
+        return
+    ts = dt.datetime.now(dt.timezone.utc)
+    metrics = dict(counts)
+    # On the very first run there's no baseline, so change counts are omitted
+    # rather than reported as a misleading "everything is new".
+    if not first_run:
+        metrics["KeysAdded"] = len(changes["added"])
+        metrics["KeysRemoved"] = len(changes["removed"])
+        metrics["KeysActivated"] = len(changes["activated"])
+        metrics["KeysDeactivated"] = len(changes["deactivated"])
+
+    data = [{"MetricName": name, "Timestamp": ts, "Value": float(val),
+             "Unit": "Count"} for name, val in metrics.items()]
+    try:
+        cw = boto3.client("cloudwatch", config=RETRY_CFG)
+        # PutMetricData accepts up to 1000 datums per call.
+        for i in range(0, len(data), 1000):
+            cw.put_metric_data(Namespace=METRIC_NAMESPACE, MetricData=data[i:i + 1000])
+        logger.info("Published %d metric(s) to CloudWatch namespace %s",
+                    len(data), METRIC_NAMESPACE)
+    except ClientError as e:
+        logger.error("Failed to publish CloudWatch metrics: %s", e)
+
+
 def handler(event, context):
     bucket = os.environ["BUCKET"]
     prefix = os.environ.get("PREFIX", "access-key-reports").strip("/")
@@ -148,8 +279,13 @@ def handler(event, context):
                 r["account_id"], r["account_name"] = aid, aname
             all_rows.extend(rows)
             logger.info("[OK]  %s %s keys=%d via %s", aid, aname, len(rows), via)
-        except ClientError as e:
-            code = e.response["Error"]["Code"]
+        except (ClientError, BotoCoreError) as e:
+            # ClientError has a structured code; BotoCoreError (timeouts,
+            # connection failures) does not, so fall back to its class name.
+            if isinstance(e, ClientError):
+                code = e.response["Error"]["Code"]
+            else:
+                code = type(e).__name__
             errors.append({"account_id": aid, "account_name": aname, "error": code})
             logger.error("[ERR] %s %s could not be inventoried: %s", aid, aname, code)
 
@@ -159,13 +295,78 @@ def handler(event, context):
     for r in sorted(all_rows, key=lambda x: (x["account_id"], x["create_date"])):
         w.writerow({k: r[k] for k in FIELDS})
 
+    s3 = boto3.client("s3", config=RETRY_CFG)
     key = f"{prefix}/{now:%Y/%m/%d}/org-access-keys-{now:%Y%m%dT%H%M%SZ}.csv"
-    boto3.client("s3").put_object(
+    s3.put_object(
         Bucket=bucket, Key=key,
         Body=buf.getvalue().encode("utf-8"),
         ContentType="text/csv",
         ServerSideEncryption="AES256",
     )
+
+    # ---- History: diff against the previous run and record what changed ------
+    state_key = f"{prefix}/{STATE_SUFFIX}"
+    prev_state = _load_state(s3, bucket, state_key)
+    first_run = not prev_state
+    curr_state = _build_state(all_rows)
+
+    # Accounts that could not be inventoried this run have NO rows, so a naive
+    # diff would report all their keys as "removed" (and re-added when the
+    # account recovers) and would persist an incomplete baseline. Instead, carry
+    # forward the previous state for those accounts and exclude them from the
+    # diff, so transient failures don't produce phantom history churn.
+    errored_ids = {e["account_id"] for e in errors}
+    if errored_ids:
+        carried = 0
+        for sid, entry in prev_state.items():
+            if entry.get("account_id") in errored_ids and sid not in curr_state:
+                curr_state[sid] = entry
+                carried += 1
+        if carried:
+            logger.info("Carried forward %d key(s) from %d un-inventoried account(s): %s",
+                        carried, len(errored_ids), ", ".join(sorted(errored_ids)))
+
+    changes = _diff_states(prev_state, curr_state)
+    change_counts = {k: len(v) for k, v in changes.items()}
+
+    # Persist the new state so the next run has a baseline to diff against.
+    try:
+        s3.put_object(
+            Bucket=bucket, Key=state_key,
+            Body=json.dumps(curr_state).encode("utf-8"),
+            ContentType="application/json",
+            ServerSideEncryption="AES256",
+        )
+    except ClientError as e:
+        logger.error("Failed to persist run state to s3://%s/%s: %s", bucket, state_key, e)
+
+    # Write a per-run changelog (skip the first run, which has no baseline).
+    history_location = None
+    if not first_run and any(change_counts.values()):
+        history_key = f"{prefix}/history/{now:%Y/%m/%d}/changes-{now:%Y%m%dT%H%M%SZ}.json"
+        changelog = {
+            "run_time": now.isoformat(),
+            "report": f"s3://{bucket}/{key}",
+            "counts": change_counts,
+            "changes": changes,
+        }
+        try:
+            s3.put_object(
+                Bucket=bucket, Key=history_key,
+                Body=json.dumps(changelog, indent=2).encode("utf-8"),
+                ContentType="application/json",
+                ServerSideEncryption="AES256",
+            )
+            history_location = f"s3://{bucket}/{history_key}"
+            logger.info("CHANGES since last run: %s -> %s", change_counts, history_location)
+        except ClientError as e:
+            logger.error("Failed to write changelog to s3://%s/%s: %s", bucket, history_key, e)
+    elif first_run:
+        logger.info("First run: %d keys recorded as the history baseline.", len(all_rows))
+
+    # ---- Metrics: publish the run's posture + changes to CloudWatch ----------
+    counts = _summarize(all_rows, len(accounts), len(errors))
+    _publish_metrics(counts, changes, first_run)
 
     status = "ATTENTION_REQUIRED" if errors else "OK"
     summary = (
@@ -186,4 +387,10 @@ def handler(event, context):
         "keys_found": len(all_rows),
         "errors": errors,
         "s3_location": f"s3://{bucket}/{key}",
+        "metrics": counts,
+        # On the first run there's no baseline, so report zeros here to match the
+        # metrics (which omit change counts) rather than "everything is new".
+        "changes": {"first_run": first_run,
+                    **({k: 0 for k in change_counts} if first_run else change_counts)},
+        "history_location": history_location,
     }

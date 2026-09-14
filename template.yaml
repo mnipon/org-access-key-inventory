@@ -45,10 +45,30 @@ Parameters:
     Description: >
       Number of trailing characters to keep visible. Set MaskHead and MaskTail
       both to 0 to disable masking and show the full key id.
+  MetricNamespace:
+    Type: String
+    Default: OrgAccessKeyInventory
+    Description: >
+      CloudWatch namespace for the inventory's custom metrics (key counts,
+      staleness, and run-to-run changes) and the dashboard.
+  StaleAgeDays:
+    Type: Number
+    Default: 90
+    Description: >
+      Age in days at/above which an access key is counted as "stale" (needs
+      rotation) in the KeysStale / KeysStaleActive metrics.
+  PublishMetrics:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Publish custom CloudWatch metrics after each run. Set to "false" to skip
+      metric publishing (the CSV report and history changelog are still written).
 
 Conditions:
   DoSchedule: !Equals [!Ref EnableSchedule, "true"]
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  DoMetrics: !Equals [!Ref PublishMetrics, "true"]
 
 Resources:
   ReportBucket:
@@ -120,6 +140,17 @@ Resources:
                 Effect: Allow
                 Action: s3:PutObject
                 Resource: !Sub "${ReportBucket.Arn}/*"
+              - Sid: ReadRunState
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${ReportBucket.Arn}/*"
+              - Sid: PublishMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: !Ref MetricNamespace
               - !If
                 - HasAlertEmail
                 - Sid: PublishAlerts
@@ -151,28 +182,53 @@ Resources:
           BUCKET: !Ref ReportBucket
           PREFIX: !Ref Prefix
           CANDIDATE_ROLES: !Join [",", !Ref CandidateRoles]
-          ALERT_TOPIC_ARN: !If [HasAlertEmail, !Ref AlertTopic, !Ref "AWS::NoValue"]
+          ALERT_TOPIC_ARN:
+            !If [HasAlertEmail, !Ref AlertTopic, !Ref "AWS::NoValue"]
           MASK_HEAD: !Ref MaskHead
           MASK_TAIL: !Ref MaskTail
+          METRIC_NAMESPACE: !Ref MetricNamespace
+          STALE_AGE_DAYS: !Ref StaleAgeDays
+          PUBLISH_METRICS: !Ref PublishMetrics
 
-  ScheduleRule:
-    Type: AWS::Events::Rule
+  # EventBridge Scheduler (the modern replacement for AWS::Events::Rule schedules).
+  # Unlike a legacy rule, Scheduler invokes the target by assuming a role, so no
+  # Lambda resource-based permission is needed.
+  SchedulerRole:
+    Type: AWS::IAM::Role
     Condition: DoSchedule
     Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-inventory
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt InventoryFunction.Arn
+
+  InventorySchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: DoSchedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-schedule"
+      Description: Recurring org-wide IAM access-key inventory.
       ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: UTC
       State: ENABLED
-      Targets:
-        - Arn: !GetAtt InventoryFunction.Arn
-          Id: inventory
-
-  SchedulePermission:
-    Type: AWS::Lambda::Permission
-    Condition: DoSchedule
-    Properties:
-      FunctionName: !Ref InventoryFunction
-      Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt ScheduleRule.Arn
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt InventoryFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
 
   # Alarm 1: the function itself crashed / timed out (Lambda Errors metric).
   FunctionErrorAlarm:
@@ -202,7 +258,7 @@ Resources:
       LogGroupName: !Ref LogGroup
       FilterPattern: '"ADMIN ACTION REQUIRED"'
       MetricTransformations:
-        - MetricNamespace: OrgAccessKeyInventory
+        - MetricNamespace: !Ref MetricNamespace
           MetricName: AdminActionRequired
           MetricValue: "1"
           DefaultValue: 0
@@ -212,7 +268,7 @@ Resources:
     Condition: HasAlertEmail
     Properties:
       AlarmDescription: One or more accounts could not be inventoried (needs admin).
-      Namespace: OrgAccessKeyInventory
+      Namespace: !Ref MetricNamespace
       MetricName: AdminActionRequired
       Statistic: Sum
       Period: 300
@@ -221,6 +277,108 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlertTopic]
+
+  # A dashboard that visualizes the custom metrics published by the Lambda:
+  # the org's key posture over time plus run-to-run changes (history).
+  InventoryDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: DoMetrics
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-access-keys"
+      DashboardBody: !Sub |
+        {
+          "start": "-P7D",
+          "periodOverride": "inherit",
+          "widgets": [
+            {
+              "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": {
+                "markdown": "# Org-wide IAM Access Key Inventory\nPosture and history from the `${AWS::StackName}-inventory` Lambda. Metrics update on each run (namespace `${MetricNamespace}`)."
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 2, "width": 24, "height": 3,
+              "properties": {
+                "title": "Current counts (latest run)",
+                "region": "${AWS::Region}",
+                "view": "singleValue",
+                "stat": "Maximum",
+                "period": 60,
+                "metrics": [
+                  [ "${MetricNamespace}", "KeysTotal" ],
+                  [ "${MetricNamespace}", "KeysActive" ],
+                  [ "${MetricNamespace}", "KeysInactive" ],
+                  [ "${MetricNamespace}", "KeysNeverUsed" ],
+                  [ "${MetricNamespace}", "KeysStale" ],
+                  [ "${MetricNamespace}", "AccountsScanned" ],
+                  [ "${MetricNamespace}", "AccountsWithErrors" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 5, "width": 12, "height": 6,
+              "properties": {
+                "title": "Keys by status over time",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stacked": false,
+                "stat": "Maximum",
+                "period": 300,
+                "metrics": [
+                  [ "${MetricNamespace}", "KeysTotal" ],
+                  [ "${MetricNamespace}", "KeysActive" ],
+                  [ "${MetricNamespace}", "KeysInactive" ],
+                  [ "${MetricNamespace}", "KeysNeverUsed" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 5, "width": 12, "height": 6,
+              "properties": {
+                "title": "Rotation risk: stale & never-used keys",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Maximum",
+                "period": 300,
+                "metrics": [
+                  [ "${MetricNamespace}", "KeysStale" ],
+                  [ "${MetricNamespace}", "KeysStaleActive" ],
+                  [ "${MetricNamespace}", "KeysNeverUsed" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 11, "width": 12, "height": 6,
+              "properties": {
+                "title": "History: changes since previous run",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [ "${MetricNamespace}", "KeysAdded" ],
+                  [ "${MetricNamespace}", "KeysRemoved" ],
+                  [ "${MetricNamespace}", "KeysActivated" ],
+                  [ "${MetricNamespace}", "KeysDeactivated" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 11, "width": 12, "height": 6,
+              "properties": {
+                "title": "Run health",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${InventoryFunction}", { "label": "Lambda invocation errors" } ],
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${InventoryFunction}", { "label": "Invocations" } ]
+                ]
+              }
+            }
+          ]
+        }
 
 Outputs:
   BucketName:
@@ -232,3 +390,17 @@ Outputs:
     Value: !Ref AlertTopic
   LogGroup:
     Value: !Ref LogGroup
+  ScheduleName:
+    Condition: DoSchedule
+    Description: EventBridge Scheduler schedule driving recurring runs.
+    Value: !Ref InventorySchedule
+  MetricNamespace:
+    Value: !Ref MetricNamespace
+    Description: CloudWatch namespace holding the inventory's custom metrics.
+  DashboardName:
+    Condition: DoMetrics
+    Value: !Sub "${AWS::StackName}-access-keys"
+  DashboardUrl:
+    Condition: DoMetrics
+    Description: Direct link to the CloudWatch dashboard.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-access-keys"
