@@ -8,6 +8,17 @@
 # If <schedule-expression> is not passed, you'll be prompted to (optionally)
 # enable a recurring run and choose how often. Pass "none" to skip the prompt
 # and deploy with no schedule.
+#
+# Optional environment variables:
+#   REPORT_PREFIX         S3 root for reports (default: credential-inventory).
+#                         Always passed as the stack's Prefix, because
+#                         `cloudformation deploy` otherwise keeps an existing
+#                         stack's previous Prefix. Set REPORT_PREFIX=access-key-reports
+#                         to keep writing under the old root.
+#   LEGACY_REPORT_PREFIX  Prefix of the previous S3 layout, read once (never
+#                         written) to seed change detection. Only needed if the
+#                         old stack used a custom Prefix; otherwise the stack's
+#                         LegacyPrefix (default access-key-reports) is kept.
 set -euo pipefail
 
 PROFILE="${1:?usage: ./deploy.sh <profile> [region] [stack-name] [alert-email] [schedule-expression]}"
@@ -15,6 +26,7 @@ REGION="${2:-us-east-1}"
 STACK="${3:-org-access-key-inventory}"
 ALERT_EMAIL="${4:-}"
 SCHEDULE_EXPR="${5:-__PROMPT__}"
+REPORT_PREFIX="${REPORT_PREFIX:-credential-inventory}"
 
 # Prompt for an alert email if not supplied as an argument.
 if [ -z "$ALERT_EMAIL" ]; then
@@ -75,6 +87,7 @@ if [ "$ENABLE_SCHEDULE" = "true" ]; then
 else
   echo ">> Schedule: DISABLED (run the Lambda manually / on demand)"
 fi
+echo ">> Reports:  <bucket>/$REPORT_PREFIX/{runs,latest,state}/ (override with REPORT_PREFIX=...)"
 
 # Ensure an artifact bucket exists to hold the packaged Lambda code.
 if ! aws s3api head-bucket --bucket "$ARTIFACT_BUCKET" --profile "$PROFILE" 2>/dev/null; then
@@ -89,6 +102,10 @@ if ! aws s3api head-bucket --bucket "$ARTIFACT_BUCKET" --profile "$PROFILE" 2>/d
     --public-access-block-configuration BlockPublicAcls=true,BlockPublicPolicy=true,IgnorePublicAcls=true,RestrictPublicBuckets=true
 fi
 
+echo ">> Note: the Bedrock API key inventory needs iam:ListServiceSpecificCredentials in"
+echo "   every member account's audit role. If you're upgrading an existing deployment,"
+echo "   run ./deploy-audit-role-stackset.sh first (it waits for the StackSet to finish)."
+
 echo ">> Packaging Lambda code"
 aws cloudformation package \
   --template-file template.yaml \
@@ -97,12 +114,17 @@ aws cloudformation package \
   --profile "$PROFILE" --region "$REGION"
 
 echo ">> Deploying stack"
+OVERRIDES=(EnableSchedule="$ENABLE_SCHEDULE" ScheduleExpression="${SCHEDULE_EXPR:-rate(1 day)}"
+           AlertEmail="$ALERT_EMAIL" Prefix="$REPORT_PREFIX")
+if [ -n "${LEGACY_REPORT_PREFIX:-}" ]; then
+  OVERRIDES+=(LegacyPrefix="$LEGACY_REPORT_PREFIX")
+fi
 aws cloudformation deploy \
   --template-file packaged.yaml \
   --stack-name "$STACK" \
   --capabilities CAPABILITY_IAM \
   --profile "$PROFILE" --region "$REGION" \
-  --parameter-overrides EnableSchedule="$ENABLE_SCHEDULE" ScheduleExpression="${SCHEDULE_EXPR:-rate(1 day)}" AlertEmail="$ALERT_EMAIL"
+  --parameter-overrides "${OVERRIDES[@]}"
 
 echo ">> Outputs:"
 aws cloudformation describe-stacks --stack-name "$STACK" --profile "$PROFILE" --region "$REGION" \

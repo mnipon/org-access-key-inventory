@@ -1,9 +1,11 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Read-only IAM role that lets the org-wide access-key inventory Lambda (running
-  in the management account) enumerate IAM access keys in this account. Deploy
-  either via a service-managed StackSet (auto-applied org-wide) or standalone in
-  a single account. No account IDs are hardcoded -- all values are parameters.
+  in the management account) enumerate IAM access keys and long-term Amazon
+  Bedrock API key metadata (IAM service-specific credentials) in this account.
+  Deploy either via a service-managed StackSet (auto-applied org-wide) or
+  standalone in a single account. No account IDs are hardcoded -- all values
+  are parameters.
 
 Parameters:
   RoleName:
@@ -28,7 +30,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Ref RoleName
-      Description: Read-only access for org-wide IAM access-key inventory.
+      Description: Read-only access for org-wide IAM access-key and Bedrock API key inventory.
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -49,6 +51,8 @@ Resources:
                   - iam:ListUsers
                   - iam:ListAccessKeys
                   - iam:GetAccessKeyLastUsed
+                  # Metadata only (never returns secrets); used for Bedrock API keys.
+                  - iam:ListServiceSpecificCredentials
                 Resource: "*"
 
 Outputs:

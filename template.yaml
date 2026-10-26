@@ -1,15 +1,37 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Org-wide IAM access key inventory. A Lambda in the management account
-  enumerates all org accounts, assumes a read role in each, lists IAM access
-  keys, and writes a consolidated CSV to an encrypted S3 bucket. Optional
-  scheduled execution.
+  Org-wide IAM access key and long-term Amazon Bedrock API key inventory. A
+  Lambda in the management account enumerates all org accounts, assumes a read
+  role in each, lists IAM access keys and Bedrock API key metadata, and writes
+  a per-run folder (manifest + CSVs + changelogs) plus a latest/ copy to an
+  encrypted, versioned S3 bucket. Optional scheduled execution.
 
 Parameters:
   Prefix:
     Type: String
+    Default: credential-inventory
+    AllowedPattern: "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$"
+    ConstraintDescription: >
+      Non-empty; letters, digits, '.', '_', '-' and inner '/' only (no leading
+      or trailing slash).
+    Description: >
+      Root S3 key prefix. Each run writes <Prefix>/runs/YYYY/MM/DD/<run-id>/
+      (manifest.json, CSVs, changelogs), refreshes <Prefix>/latest/, and keeps
+      change-detection state in <Prefix>/state/. Stacks created before the
+      run-centric layout used access-key-reports (see LegacyPrefix).
+  LegacyPrefix:
+    Type: String
     Default: access-key-reports
-    Description: S3 key prefix for reports.
+    AllowedPattern: "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$"
+    ConstraintDescription: >
+      Non-empty; letters, digits, '.', '_', '-' and inner '/' only (no leading
+      or trailing slash).
+    Description: >
+      Prefix of the previous S3 layout. Read only when <Prefix>/state/ has no
+      state yet, to seed change detection from
+      <LegacyPrefix>/state/keys-state.json and
+      <LegacyPrefix>/bedrock-api-keys/state/keys-state.json. Nothing under it
+      is ever modified, moved, or deleted.
   CandidateRoles:
     Type: CommaDelimitedList
     Default: OrgAccessKeyAuditRole,OrganizationAccountAccessRole,AWSControlTowerExecution
@@ -64,6 +86,24 @@ Parameters:
     Description: >
       Publish custom CloudWatch metrics after each run. Set to "false" to skip
       metric publishing (the CSV report and history changelog are still written).
+  IncludeBedrockKeys:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Also inventory long-term Amazon Bedrock API keys (IAM service-specific
+      credentials) into bedrock-api-keys.csv in each run folder (and latest/).
+      Requires iam:ListServiceSpecificCredentials in every member account's
+      audit role: redeploy the OrgAccessKeyAuditRole StackSet first. Short-term
+      Bedrock API keys cannot be inventoried.
+  BedrockExpiryWarnDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: >
+      An active Bedrock API key that expires within this many days is counted
+      in the BedrockKeysExpiringSoon metric.
 
 Conditions:
   DoSchedule: !Equals [!Ref EnableSchedule, "true"]
@@ -87,6 +127,22 @@ Resources:
         RestrictPublicBuckets: true
       VersioningConfiguration:
         Status: Enabled
+      # latest/ and state/ are overwritten every run, so their old versions pile
+      # up; expire those noncurrent versions after 30 days. runs/ is never
+      # expired, and current versions never expire. CloudFormation owns the
+      # bucket's lifecycle rules: rules added by hand are replaced on update.
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-noncurrent-latest
+            Status: Enabled
+            Prefix: !Sub "${Prefix}/latest/"
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          - Id: expire-noncurrent-state
+            Status: Enabled
+            Prefix: !Sub "${Prefix}/state/"
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
 
   AlertTopic:
     Type: AWS::SNS::Topic
@@ -135,6 +191,7 @@ Resources:
                   - iam:ListUsers
                   - iam:ListAccessKeys
                   - iam:GetAccessKeyLastUsed
+                  - iam:ListServiceSpecificCredentials
                 Resource: "*"
               - Sid: WriteReport
                 Effect: Allow
@@ -170,7 +227,7 @@ Resources:
     DependsOn: LogGroup
     Properties:
       FunctionName: !Sub "${AWS::StackName}-inventory"
-      Description: Org-wide IAM access key inventory to S3 CSV
+      Description: Org-wide IAM access key and Bedrock API key inventory to S3 CSV
       Runtime: python3.12
       Handler: lambda_function.handler
       Timeout: 300
@@ -181,6 +238,7 @@ Resources:
         Variables:
           BUCKET: !Ref ReportBucket
           PREFIX: !Ref Prefix
+          LEGACY_PREFIX: !Ref LegacyPrefix
           CANDIDATE_ROLES: !Join [",", !Ref CandidateRoles]
           ALERT_TOPIC_ARN:
             !If [HasAlertEmail, !Ref AlertTopic, !Ref "AWS::NoValue"]
@@ -189,6 +247,8 @@ Resources:
           METRIC_NAMESPACE: !Ref MetricNamespace
           STALE_AGE_DAYS: !Ref StaleAgeDays
           PUBLISH_METRICS: !Ref PublishMetrics
+          INCLUDE_BEDROCK_KEYS: !Ref IncludeBedrockKeys
+          BEDROCK_EXPIRY_WARN_DAYS: !Ref BedrockExpiryWarnDays
 
   # EventBridge Scheduler (the modern replacement for AWS::Events::Rule schedules).
   # Unlike a legacy rule, Scheduler invokes the target by assuming a role, so no
@@ -267,7 +327,10 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Condition: HasAlertEmail
     Properties:
-      AlarmDescription: One or more accounts could not be inventoried (needs admin).
+      AlarmDescription: >
+        One or more accounts could not be inventoried, their Bedrock API keys
+        could not be listed, or a report/state file could not be written to S3
+        (needs admin).
       Namespace: !Ref MetricNamespace
       MetricName: AdminActionRequired
       Statistic: Sum
@@ -309,6 +372,7 @@ Resources:
                   [ "${MetricNamespace}", "KeysActive" ],
                   [ "${MetricNamespace}", "KeysInactive" ],
                   [ "${MetricNamespace}", "KeysNeverUsed" ],
+                  [ "${MetricNamespace}", "KeysLastUsedUnknown" ],
                   [ "${MetricNamespace}", "KeysStale" ],
                   [ "${MetricNamespace}", "AccountsScanned" ],
                   [ "${MetricNamespace}", "AccountsWithErrors" ]
@@ -376,6 +440,95 @@ Resources:
                   [ "AWS/Lambda", "Invocations", "FunctionName", "${InventoryFunction}", { "label": "Invocations" } ]
                 ]
               }
+            },
+            {
+              "type": "text", "x": 0, "y": 17, "width": 24, "height": 2,
+              "properties": {
+                "markdown": "## Amazon Bedrock API keys (long-term)\nLong-term Bedrock API keys are IAM service-specific credentials (report: `bedrock-api-keys.csv` in each run folder and in `latest/`). Short-term Bedrock API keys are never stored in IAM and cannot be inventoried; detect their use with CloudTrail."
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 19, "width": 24, "height": 3,
+              "properties": {
+                "title": "Bedrock API keys: current counts (latest run)",
+                "region": "${AWS::Region}",
+                "view": "singleValue",
+                "stat": "Maximum",
+                "period": 60,
+                "metrics": [
+                  [ "${MetricNamespace}", "BedrockKeysTotal" ],
+                  [ "${MetricNamespace}", "BedrockKeysActive" ],
+                  [ "${MetricNamespace}", "BedrockKeysInactive" ],
+                  [ "${MetricNamespace}", "BedrockKeysNoExpiryActive" ],
+                  [ "${MetricNamespace}", "BedrockKeysExpiringSoon" ],
+                  [ "${MetricNamespace}", "BedrockKeysExpired" ],
+                  [ "${MetricNamespace}", "BedrockKeysStaleActive" ],
+                  [ "${MetricNamespace}", "BedrockAccountsWithErrors" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 22, "width": 12, "height": 6,
+              "properties": {
+                "title": "Bedrock API keys by status",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stacked": false,
+                "stat": "Maximum",
+                "period": 300,
+                "metrics": [
+                  [ "${MetricNamespace}", "BedrockKeysTotal" ],
+                  [ "${MetricNamespace}", "BedrockKeysActive" ],
+                  [ "${MetricNamespace}", "BedrockKeysInactive" ],
+                  [ "${MetricNamespace}", "BedrockKeysExpired" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 22, "width": 12, "height": 6,
+              "properties": {
+                "title": "Bedrock API key expiry risk",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Maximum",
+                "period": 300,
+                "metrics": [
+                  [ "${MetricNamespace}", "BedrockKeysNoExpiry" ],
+                  [ "${MetricNamespace}", "BedrockKeysNoExpiryActive" ],
+                  [ "${MetricNamespace}", "BedrockKeysExpiringSoon" ],
+                  [ "${MetricNamespace}", "BedrockKeysStaleActive" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 28, "width": 12, "height": 6,
+              "properties": {
+                "title": "Bedrock history: changes since previous run",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [ "${MetricNamespace}", "BedrockKeysAdded" ],
+                  [ "${MetricNamespace}", "BedrockKeysRemoved" ],
+                  [ "${MetricNamespace}", "BedrockKeysActivated" ],
+                  [ "${MetricNamespace}", "BedrockKeysDeactivated" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 28, "width": 12, "height": 6,
+              "properties": {
+                "title": "Bedrock coverage",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Maximum",
+                "period": 300,
+                "metrics": [
+                  [ "${MetricNamespace}", "BedrockAccountsWithErrors", { "label": "Bedrock listing failed (account otherwise inventoried)" } ],
+                  [ "${MetricNamespace}", "AccountsWithErrors", { "label": "Account not inventoried at all" } ]
+                ]
+              }
             }
           ]
         }
@@ -397,6 +550,17 @@ Outputs:
   MetricNamespace:
     Value: !Ref MetricNamespace
     Description: CloudWatch namespace holding the inventory's custom metrics.
+  RunsPrefix:
+    Description: >
+      One folder per run (runs/YYYY/MM/DD/<run-id>/) with manifest.json, the
+      CSVs, and changelogs.
+    Value: !Sub "s3://${ReportBucket}/${Prefix}/runs/"
+  LatestPrefix:
+    Description: Copy of the most recent run's CSVs and manifest.json.
+    Value: !Sub "s3://${ReportBucket}/${Prefix}/latest/"
+  StatePrefix:
+    Description: Change-detection state (access-keys.json, bedrock-api-keys.json).
+    Value: !Sub "s3://${ReportBucket}/${Prefix}/state/"
   DashboardName:
     Condition: DoMetrics
     Value: !Sub "${AWS::StackName}-access-keys"

@@ -24,9 +24,30 @@ ROOT_ID=$(aws organizations list-roots --profile "$PROFILE" \
 
 echo ">> Mgmt account: $MGMT_ID  Org: $ORG_ID  Root: $ROOT_ID  Role: $ROLE_NAME"
 
+# Block until a StackSet operation finishes, so the inventory Lambda never runs
+# against member roles that haven't been updated yet. Returns non-zero on
+# FAILED/STOPPED (which stops this script under `set -e`).
+wait_for_op() {
+  local op_id="$1" status
+  while true; do
+    status=$(aws cloudformation describe-stack-set-operation --stack-set-name "$STACKSET" \
+      --operation-id "$op_id" --query StackSetOperation.Status --output text \
+      --profile "$PROFILE" --region "$REGION")
+    echo "   operation $op_id: $status"
+    case "$status" in
+      SUCCEEDED) return 0 ;;
+      FAILED|STOPPED)
+        echo "!! StackSet operation $op_id ended with $status. Per-account details:" >&2
+        echo "   aws cloudformation list-stack-set-operation-results --stack-set-name \"$STACKSET\" --operation-id \"$op_id\" --profile \"$PROFILE\" --region \"$REGION\"" >&2
+        return 1 ;;
+    esac
+    sleep 15
+  done
+}
+
 echo ">> Creating/updating StackSet"
 if aws cloudformation describe-stack-set --stack-set-name "$STACKSET" --profile "$PROFILE" --region "$REGION" >/dev/null 2>&1; then
-  aws cloudformation update-stack-set --stack-set-name "$STACKSET" \
+  OP_ID=$(aws cloudformation update-stack-set --stack-set-name "$STACKSET" \
     --template-body file://member-audit-role.yaml \
     --permission-model SERVICE_MANAGED \
     --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
@@ -34,7 +55,10 @@ if aws cloudformation describe-stack-set --stack-set-name "$STACKSET" --profile 
     --parameters ParameterKey=RoleName,ParameterValue="$ROLE_NAME" \
                  ParameterKey=TrustedAccountId,ParameterValue="$MGMT_ID" \
                  ParameterKey=OrgId,ParameterValue="$ORG_ID" \
-    --profile "$PROFILE" --region "$REGION"
+    --query OperationId --output text \
+    --profile "$PROFILE" --region "$REGION")
+  echo ">> Waiting for the StackSet update to reach every existing member account"
+  wait_for_op "$OP_ID"
 else
   aws cloudformation create-stack-set --stack-set-name "$STACKSET" \
     --template-body file://member-audit-role.yaml \
@@ -50,10 +74,15 @@ fi
 echo ">> Creating stack instances across the org root (auto-covers new accounts)"
 # IAM is global -> deploy to a single region only. Service-managed StackSets
 # skip the management account automatically (Lambda reads it directly).
-aws cloudformation create-stack-instances --stack-set-name "$STACKSET" \
+if OP_ID=$(aws cloudformation create-stack-instances --stack-set-name "$STACKSET" \
   --deployment-targets OrganizationalUnitIds="$ROOT_ID" \
   --regions "$REGION" \
-  --profile "$PROFILE" --region "$REGION" || \
+  --query OperationId --output text \
+  --profile "$PROFILE" --region "$REGION"); then
+  wait_for_op "$OP_ID"
+else
   echo "(stack instances may already exist -- run update-stack-instances if needed)"
+fi
 
-echo ">> Done. Verify with: aws cloudformation list-stack-instances --stack-set-name $STACKSET --profile $PROFILE --region $REGION"
+echo ">> Done. Verify every instance is CURRENT with:"
+echo "   aws cloudformation list-stack-instances --stack-set-name \"$STACKSET\" --profile \"$PROFILE\" --region \"$REGION\""
