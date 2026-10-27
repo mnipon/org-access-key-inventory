@@ -116,8 +116,6 @@ REGION=us-east-1        # IAM is global; a single region is fine
 > inventory. `deploy-audit-role-stackset.sh` waits for each StackSet operation
 > to reach `SUCCEEDED`, and exits non-zero if it ends `FAILED` or `STOPPED`
 > (it prints the `list-stack-set-operation-results` command to see why).
-> Upgrading an existing deployment? See
-> [Upgrading an existing deployment](#upgrading-an-existing-deployment).
 
 `deploy.sh` will prompt:
 
@@ -179,9 +177,9 @@ aws cloudformation deploy --template-file packaged.yaml \
 
 `deploy.sh` always passes `Prefix` (from `REPORT_PREFIX`, default
 `credential-inventory`), because `cloudformation deploy` would otherwise keep an
-existing stack's previous `Prefix`. `LEGACY_REPORT_PREFIX` is only needed when
-upgrading a stack that used a custom `Prefix` (see
-[Upgrading to the run-centric S3 layout](#upgrading-to-the-run-centric-s3-layout)).
+existing stack's previous `Prefix`. `LEGACY_REPORT_PREFIX` is only needed if an
+older deployment wrote its reports under a custom root instead of
+`access-key-reports`.
 
 > **Email confirmation is required.** If you set `AlertEmail`, click the
 > "Confirm subscription" link in the email AWS sends you (one-time), or alerts
@@ -734,7 +732,8 @@ So a manifest only exists once everything it describes has been attempted.
   it is never shown as written. A changelog that wasn't needed is absent.
 - `state_files` uses the same rule for `state/`.
 - `previous_state` is the state file the diff was based on (`null` on a first
-  run; an `access-key-reports/...` path on the first run after the upgrade).
+  run; an `access-key-reports/...` path on the first run after moving from the
+  old layout).
 - With `IncludeBedrockKeys=false`, `bedrock` is `{"enabled": false}` and there
   are no Bedrock entries in `files` or `state_files`.
 
@@ -854,8 +853,8 @@ policy denies `s3:PutObject`) doesn't abort the run:
   `N report/state file(s) could NOT be written to S3`, listing each URI.
 
 A failed **state** write matters most: the next run then diffs against the last
-state that was saved (on the first run after the upgrade, that is the legacy
-state again), so its changes span two runs.
+state that was saved (on the first run after moving from the old layout, that
+is the legacy state again), so its changes span two runs.
 
 ### What "needs admin to check" means and how to fix it
 
@@ -937,7 +936,7 @@ aws s3 rb "s3://access-key-audit-artifacts-${ACCOUNT_ID}-${REGION}" --force --pr
   restricted to the `MetricNamespace` via an IAM condition, and `sns:Publish`
   only to the alert topic. It has no `s3:DeleteObject` or `s3:ListBucket`, so it
   can't remove or move old reports (including the legacy `access-key-reports/`
-  objects it reads once during the upgrade).
+  objects it reads once when moving from the old layout).
 - The history state, changelogs and manifests store **masked** key IDs, S3 URIs
   and a one-way `sha256` of `account_id:access_key_id` as the identifier — no
   raw key IDs and never any secret keys.
@@ -974,118 +973,6 @@ With botocore ≥ 1.39.0 every test runs. With an older botocore the two
 against that older IAM model instead. `PYTHONDONTWRITEBYTECODE=1` keeps
 `__pycache__` out of `tests/` (the test module already keeps it out of `lambda/`,
 which `cloudformation package` zips as-is).
-
----
-
-## Upgrading an existing deployment
-
-Deployments from before Bedrock API key support need the new
-`iam:ListServiceSpecificCredentials` permission in every member account, so
-**redeploy the StackSet first, then the main stack**. Until the StackSet update
-reaches an account, that account is reported in `bedrock.errors[]` (its access
-keys are still inventoried).
-
-```bash
-PROFILE=<mgmt-profile>; REGION=us-east-1; STACK=org-access-key-inventory
-
-# 0) Note your current main-stack settings: deploy.sh always overrides AlertEmail/EnableSchedule/ScheduleExpression
-aws cloudformation describe-stacks --stack-name "$STACK" --profile "$PROFILE" --region "$REGION" \
-  --query "Stacks[0].Parameters[?ParameterKey=='AlertEmail'||ParameterKey=='EnableSchedule'||ParameterKey=='ScheduleExpression']" --output table
-
-# 1) FIRST update the member audit role (adds iam:ListServiceSpecificCredentials); the script waits for SUCCEEDED
-./deploy-audit-role-stackset.sh "$PROFILE" "$REGION"
-aws cloudformation list-stack-instances --stack-set-name org-access-key-audit-role --profile "$PROFILE" --region "$REGION" \
-  --query "Summaries[?Status!='CURRENT'].[Account,Status,StatusReason]" --output table   # expect no rows
-
-# 2) THEN redeploy the main stack, re-entering the SAME email/schedule from step 0 (a blank email removes SNS alerting).
-#    If you had no alert email, an empty 4th arg still triggers the prompt -- just press Enter there.
-./deploy.sh "$PROFILE" "$REGION" "$STACK" "<same-alert-email>" "<same-schedule-expression-or-none>"
-
-# 3) Invoke and check: bedrock.enabled=true, bedrock.errors=[], listing_mode=all_users, expiry_supported=true,
-#    bedrock.changes.first_run=true on this first Bedrock run (baseline)
-aws lambda invoke --function-name "$STACK-inventory" --profile "$PROFILE" --region "$REGION" \
-  --cli-binary-format raw-in-base64-out out.json && cat out.json
-```
-
-The new stack parameters `IncludeBedrockKeys` (default `true`) and
-`BedrockExpiryWarnDays` (default `30`) take their defaults on the first deploy
-and keep their previous values on later ones; `deploy.sh` doesn't override them.
-
-**Roll back / opt out** without touching other settings (parameters you don't
-override keep their previous values):
-
-```bash
-aws cloudformation deploy --template-file packaged.yaml --stack-name "$STACK" \
-  --capabilities CAPABILITY_IAM --parameter-overrides IncludeBedrockKeys=false \
-  --profile "$PROFILE" --region "$REGION"
-```
-
-The extra read-only permission in the member role is harmless to leave in place.
-If `expiry_supported` comes back `false`, see
-[Listing mode and SDK version](#listing-mode-and-sdk-version).
-
-### Upgrading to the run-centric S3 layout
-
-Older versions wrote everything under `access-key-reports/`: dated CSVs
-(`YYYY/MM/DD/org-access-keys-<ts>.csv`), `state/keys-state.json`,
-`history/...` changelogs, and the same again under `bedrock-api-keys/`. Linking
-one run's files meant matching timestamps across folders. The new layout puts
-each run in one folder with a manifest (see [S3 layout](#s3-layout)). No
-StackSet change is needed for this part.
-
-1. **Redeploy** with `./deploy.sh` (same email/schedule arguments as above). It
-   now always passes `Prefix`, default `credential-inventory`:
-   - keep the old root instead: `REPORT_PREFIX=access-key-reports ./deploy.sh ...`;
-   - if the old stack used a **custom** `Prefix`, also set
-     `LEGACY_REPORT_PREFIX=<old-prefix>` so the first run finds the old state.
-     Otherwise the new `LegacyPrefix` parameter takes its default,
-     `access-key-reports`.
-2. **Invoke once and check** that `changes.first_run=false` and
-   `bedrock.changes.first_run=false`, and that the run manifest's
-   `access_keys.previous_state` / `bedrock.previous_state` point at
-   `access-key-reports/...`. That first run read the old state once,
-   read-only; from then on only `credential-inventory/state/` is used. Accounts
-   with no entries in the old state appear once under `baselined_accounts`
-   (with a WARNING if they hold keys; see
-   [History](#history-change-detection)).
-3. **Old reports stay where they are.** Nothing is deleted or moved. To keep
-   everything under one root, copy them yourself (optional):
-   ```bash
-   aws s3 cp "s3://$BUCKET/access-key-reports/" "s3://$BUCKET/credential-inventory/legacy/access-key-reports/" \
-     --recursive --profile "$PROFILE" --region "$REGION"
-   ```
-   This copies current versions only. The copies don't go into `runs/`, have
-   no manifest, and keep their old file names and columns.
-
-**Breaking changes** to check before you upgrade:
-
-- `run_id` is the **first column** of both CSVs. Update any parser that reads
-  columns by position.
-- The stack output `BedrockReportPrefix` is replaced by `RunsPrefix`,
-  `LatestPrefix` and `StatePrefix`.
-- `s3_location`, `bedrock.s3_location`, `history_location` and
-  `manifest_location` can be `null` when that write failed, and
-  `ATTENTION_REQUIRED` (with `AdminActionAlarm`) now also covers S3 write
-  failures (`write_errors[]`). Before, a failed access-key CSV write crashed the
-  invocation instead.
-- Keys in an account listed for the first time are baselined, not counted in
-  `KeysAdded` / `BedrockKeysAdded`.
-- `last_used` no longer uses `N/A`: it is `Never` when IAM has no record of use
-  and `Unknown` when the lookup failed. `KeysNeverUsed` counts only `Never`;
-  failed lookups go to the new `KeysLastUsedUnknown` metric.
-- `never_expires` in the Bedrock CSV uses `Unknown` (was `unknown`) when the
-  SDK can't report expiration dates.
-- The new lifecycle rules expire noncurrent versions under `latest/` and
-  `state/` after 30 days. CloudFormation now owns the bucket's lifecycle
-  configuration and replaces any rules you added by hand.
-
-**Roll back** by redeploying the previous code with
-`Prefix=access-key-reports` (pass it explicitly; otherwise the stack keeps
-`credential-inventory`). The old code reads its own old state, which dates from
-before the upgrade, so its first run diffs against that older baseline and
-reports every change since then. If you later roll forward again, the
-new-layout state (from before the rollback) is used, not the newer legacy
-state; the diffs are still correct relative to it.
 
 ---
 
