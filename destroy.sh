@@ -9,12 +9,21 @@
 # The report S3 bucket is RETAINED by design (DeletionPolicy: Retain) so reports
 # are not lost. Empty/delete it manually if you truly want it gone.
 #
+# You are asked to type the stack name to confirm (no input aborts). FORCE=1
+# skips the prompt, e.g. for automation.
+#
 # Usage: ./destroy.sh <aws-profile> [region] [stack-name]
 set -euo pipefail
+cd "$(dirname "$0")"
 
 PROFILE="${1:?usage: ./destroy.sh <profile> [region] [stack-name]}"
 REGION="${2:-us-east-1}"
 STACK="${3:-org-access-key-inventory}"
+
+if [ "${FORCE:-}" != "1" ]; then
+  read -r -p "Delete stack '$STACK' (region $REGION, profile $PROFILE)? Type the stack name to confirm: " CONFIRM || CONFIRM=""
+  [ "$CONFIRM" = "$STACK" ] || { echo "Aborted: nothing was deleted." >&2; exit 1; }
+fi
 
 echo ">> Deleting main stack '$STACK' (report bucket is retained)"
 aws cloudformation delete-stack --stack-name "$STACK" --profile "$PROFILE" --region "$REGION"

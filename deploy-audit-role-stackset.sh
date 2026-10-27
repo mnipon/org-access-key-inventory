@@ -6,12 +6,22 @@
 # Prereqs: trusted access between AWS Organizations and CloudFormation StackSets
 #   aws cloudformation activate-organizations-access --profile <mgmt>
 #
-# Usage: ./deploy-audit-role-stackset.sh <mgmt-profile> [region] [role-name]
+# Usage: ./deploy-audit-role-stackset.sh <mgmt-profile> [region] [role-name] [inventory-stack-name]
+#
+# [inventory-stack-name] is deploy.sh's stack name (default
+# org-access-key-inventory): the member role trusts only
+# <inventory-stack-name>-inventory-role. Updating an existing deployment: run
+# this AFTER deploy.sh, which creates that role.
 set -euo pipefail
+# member-audit-role.yaml is resolved relative to this repo.
+cd "$(dirname "$0")"
 
-PROFILE="${1:?usage: ./deploy-audit-role-stackset.sh <mgmt-profile> [region] [role-name]}"
+PROFILE="${1:?usage: ./deploy-audit-role-stackset.sh <mgmt-profile> [region] [role-name] [inventory-stack-name]}"
 REGION="${2:-us-east-1}"
 ROLE_NAME="${3:-OrgAccessKeyAuditRole}"
+# Must match deploy.sh's stack name; the member role trusts only this role.
+INVENTORY_STACK="${4:-org-access-key-inventory}"
+INVENTORY_ROLE_NAME="${INVENTORY_STACK}-inventory-role"
 STACKSET="org-access-key-audit-role"
 
 # Discover management account id, org id, and org root id -- nothing hardcoded.
@@ -22,7 +32,7 @@ ORG_ID=$(aws organizations describe-organization --profile "$PROFILE" \
 ROOT_ID=$(aws organizations list-roots --profile "$PROFILE" \
   --query "Roots[0].Id" --output text)
 
-echo ">> Mgmt account: $MGMT_ID  Org: $ORG_ID  Root: $ROOT_ID  Role: $ROLE_NAME"
+echo ">> Mgmt account: $MGMT_ID  Org: $ORG_ID  Root: $ROOT_ID  Role: $ROLE_NAME  Trusted role: $INVENTORY_ROLE_NAME"
 
 # Block until a StackSet operation finishes, so the inventory Lambda never runs
 # against member roles that haven't been updated yet. Returns non-zero on
@@ -55,6 +65,7 @@ if aws cloudformation describe-stack-set --stack-set-name "$STACKSET" --profile 
     --parameters ParameterKey=RoleName,ParameterValue="$ROLE_NAME" \
                  ParameterKey=TrustedAccountId,ParameterValue="$MGMT_ID" \
                  ParameterKey=OrgId,ParameterValue="$ORG_ID" \
+                 ParameterKey=InventoryRoleName,ParameterValue="$INVENTORY_ROLE_NAME" \
     --query OperationId --output text \
     --profile "$PROFILE" --region "$REGION")
   echo ">> Waiting for the StackSet update to reach every existing member account"
@@ -68,6 +79,7 @@ else
     --parameters ParameterKey=RoleName,ParameterValue="$ROLE_NAME" \
                  ParameterKey=TrustedAccountId,ParameterValue="$MGMT_ID" \
                  ParameterKey=OrgId,ParameterValue="$ORG_ID" \
+                 ParameterKey=InventoryRoleName,ParameterValue="$INVENTORY_ROLE_NAME" \
     --profile "$PROFILE" --region "$REGION"
 fi
 

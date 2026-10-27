@@ -3,9 +3,10 @@ Description: >
   Read-only IAM role that lets the org-wide access-key inventory Lambda (running
   in the management account) enumerate IAM access keys and long-term Amazon
   Bedrock API key metadata (IAM service-specific credentials) in this account.
-  Deploy either via a service-managed StackSet (auto-applied org-wide) or
-  standalone in a single account. No account IDs are hardcoded -- all values
-  are parameters.
+  Only the inventory Lambda's role (InventoryRoleName in TrustedAccountId, from
+  your org) can assume it. Deploy either via a service-managed StackSet
+  (auto-applied org-wide) or standalone in a single account. No account IDs are
+  hardcoded -- all values are parameters.
 
 Parameters:
   RoleName:
@@ -18,12 +19,22 @@ Parameters:
     Description: >
       Account ID that hosts the inventory Lambda (your management or audit
       account). Supplied at deploy time -- never hardcoded in this template.
+  InventoryRoleName:
+    Type: String
+    Default: org-access-key-inventory-inventory-role
+    AllowedPattern: '^[\w+=,.@-]{1,64}$'
+    Description: >
+      Name of the inventory Lambda's role in TrustedAccountId (<stack>-inventory-role;
+      deploy-audit-role-stackset.sh derives it from the main stack name). Only
+      that role can assume this one.
   OrgId:
     Type: String
     AllowedPattern: "^o-[a-z0-9]{10,32}$"
     Description: >
       Your AWS Organizations ID (o-xxxx). Used as an aws:PrincipalOrgID
-      condition so only principals from your org can assume this role.
+      condition, together with the aws:PrincipalArn condition on
+      InventoryRoleName, so only the inventory role from your org can assume
+      this role.
 
 Resources:
   AuditRole:
@@ -41,6 +52,11 @@ Resources:
             Condition:
               StringEquals:
                 aws:PrincipalOrgID: !Ref OrgId
+              ArnEquals:
+                # Only the inventory role, not every principal in the trusted account.
+                # A condition (not a role principal), so the StackSet can be deployed
+                # before the role exists and keeps working if the role is re-created.
+                aws:PrincipalArn: !Sub "arn:aws:iam::${TrustedAccountId}:role/${InventoryRoleName}"
       Policies:
         - PolicyName: read-access-keys
           PolicyDocument:

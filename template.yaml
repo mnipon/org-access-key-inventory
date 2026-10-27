@@ -34,11 +34,25 @@ Parameters:
       is ever modified, moved, or deleted.
   CandidateRoles:
     Type: CommaDelimitedList
-    Default: OrgAccessKeyAuditRole,OrganizationAccountAccessRole,AWSControlTowerExecution
+    Default: OrgAccessKeyAuditRole
+    # The IAM grant is built from these names, so reject wildcards and empty entries.
+    AllowedPattern: '^[\w+=,.@-]{1,64}$'
+    ConstraintDescription: Comma-separated IAM role names (no empty entries).
     Description: >
-      Role names to try (in order) when assuming into a member account. The
-      Lambda uses the first one it can assume. If you add a custom name here,
-      also add its ARN to the AssumeMemberRoles policy statement below.
+      Member-account role names to try (in order). The Lambda uses the first
+      one it can assume, and its role may assume exactly these names, only in
+      your organization. OrganizationAccountAccessRole and
+      AWSControlTowerExecution are ignored here unless AllowAdminRoleFallback=true.
+  AllowAdminRoleFallback:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      "true" also tries (and allows assuming) the admin roles
+      OrganizationAccountAccessRole and AWSControlTowerExecution after
+      CandidateRoles. Sessions are still limited to the four read-only IAM
+      calls by a session policy. Default "false": accounts without the audit
+      role are reported as errors.
   EnableSchedule:
     Type: String
     Default: "false"
@@ -53,20 +67,25 @@ Parameters:
     Default: ""
     Description: >
       Email address to notify when the inventory hits errors that need an
-      administrator. If left blank, NO SNS topic, subscription, or alarms are
-      created at all (error details still appear in the return payload and
+      administrator. If left blank, NO SNS topic, subscription, or
+      AdminActionAlarm is created (FunctionErrorAlarm is still created, without
+      a notification; error details still appear in the return payload and
       CloudWatch logs). If set, AWS emails a one-time subscription confirmation
       that you MUST click before any alerts can be delivered.
   MaskHead:
     Type: Number
     Default: 4
-    Description: Number of leading characters of the access key id to keep visible.
+    MinValue: 0
+    MaxValue: 8
+    Description: Number of leading characters of the access key id to keep visible (0-8).
   MaskTail:
     Type: Number
     Default: 4
+    MinValue: 0
+    MaxValue: 8
     Description: >
-      Number of trailing characters to keep visible. Set MaskHead and MaskTail
-      both to 0 to disable masking and show the full key id.
+      Number of trailing characters to keep visible (0-8). Set MaskHead and
+      MaskTail both to 0 to show the full key id (opt-in).
   MetricNamespace:
     Type: String
     Default: OrgAccessKeyInventory
@@ -109,6 +128,7 @@ Conditions:
   DoSchedule: !Equals [!Ref EnableSchedule, "true"]
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
   DoMetrics: !Equals [!Ref PublishMetrics, "true"]
+  AdminFallback: !Equals [!Ref AllowAdminRoleFallback, "true"]
 
 Resources:
   ReportBucket:
@@ -125,6 +145,10 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      # ACLs off: the bucket owner owns every object.
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
       VersioningConfiguration:
         Status: Enabled
       # latest/ and state/ are overwritten every run, so their old versions pile
@@ -144,6 +168,25 @@ Resources:
             NoncurrentVersionExpiration:
               NoncurrentDays: 30
 
+  # Reject plain-HTTP requests to the report bucket.
+  ReportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReportBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"   # a Deny for every caller, not a grant
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ReportBucket.Arn
+              - !Sub "${ReportBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
   AlertTopic:
     Type: AWS::SNS::Topic
     Condition: HasAlertEmail
@@ -161,6 +204,10 @@ Resources:
   FunctionRole:
     Type: AWS::IAM::Role
     Properties:
+      # Named so member audit roles can trust exactly this role (aws:PrincipalArn
+      # in member-audit-role.yaml). IAM role names max out at 64 characters, so
+      # the stack name must be <= 49; naming a role needs CAPABILITY_NAMED_IAM.
+      RoleName: !Sub "${AWS::StackName}-inventory-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -178,13 +225,40 @@ Resources:
                 Effect: Allow
                 Action: organizations:ListAccounts
                 Resource: "*"
-              - Sid: AssumeMemberRoles
+              # Grant follows CandidateRoles, and only for roles in this org.
+              # "${aws:PrincipalOrgID}" is an IAM policy variable, not !Sub (the
+              # ARNs use !Join); inside a !Sub it would need ${!aws:PrincipalOrgID}.
+              - Sid: AssumeCandidateRoles
                 Effect: Allow
                 Action: sts:AssumeRole
-                Resource:
-                  - arn:aws:iam::*:role/OrgAccessKeyAuditRole
-                  - arn:aws:iam::*:role/OrganizationAccountAccessRole
-                  - arn:aws:iam::*:role/AWSControlTowerExecution
+                Resource: !Split
+                  - ","
+                  - !Join
+                    - ""
+                    - - "arn:aws:iam::*:role/"
+                      - !Join [",arn:aws:iam::*:role/", !Ref CandidateRoles]
+                Condition:
+                  StringEquals:
+                    aws:ResourceOrgID: "${aws:PrincipalOrgID}"
+              - !If
+                - AdminFallback
+                - Sid: AssumeAdminFallbackRoles
+                  Effect: Allow
+                  Action: sts:AssumeRole
+                  Resource:
+                    - arn:aws:iam::*:role/OrganizationAccountAccessRole
+                    - arn:aws:iam::*:role/AWSControlTowerExecution
+                  Condition:
+                    StringEquals:
+                      aws:ResourceOrgID: "${aws:PrincipalOrgID}"
+                # Without the opt-in, never allow the admin roles, even if listed
+                # in CandidateRoles.
+                - Sid: DenyAdminRolesWithoutOptIn
+                  Effect: Deny
+                  Action: sts:AssumeRole
+                  Resource:
+                    - arn:aws:iam::*:role/OrganizationAccountAccessRole
+                    - arn:aws:iam::*:role/AWSControlTowerExecution
               - Sid: ReadLocalIamKeys
                 Effect: Allow
                 Action:
@@ -230,16 +304,23 @@ Resources:
       Description: Org-wide IAM access key and Bedrock API key inventory to S3 CSV
       Runtime: python3.12
       Handler: lambda_function.handler
-      Timeout: 300
+      # Accounts are scanned one after another and every S3 write happens after
+      # the scan, so give large orgs the Lambda maximum.
+      Timeout: 900
       MemorySize: 256
       Role: !GetAtt FunctionRole.Arn
       Code: ./lambda
+      # Plain-text log lines (the default), pinned: the AdminActionRequired
+      # metric filter parses "[LEVEL]<tab>time<tab>request-id<tab>message".
+      LoggingConfig:
+        LogFormat: Text
       Environment:
         Variables:
           BUCKET: !Ref ReportBucket
           PREFIX: !Ref Prefix
           LEGACY_PREFIX: !Ref LegacyPrefix
           CANDIDATE_ROLES: !Join [",", !Ref CandidateRoles]
+          ALLOW_ADMIN_ROLE_FALLBACK: !Ref AllowAdminRoleFallback
           ALERT_TOPIC_ARN:
             !If [HasAlertEmail, !Ref AlertTopic, !Ref "AWS::NoValue"]
           MASK_HEAD: !Ref MaskHead
@@ -291,9 +372,10 @@ Resources:
         RoleArn: !GetAtt SchedulerRole.Arn
 
   # Alarm 1: the function itself crashed / timed out (Lambda Errors metric).
+  # Always created so a failing run shows up in CloudWatch; it only notifies
+  # when an AlertEmail (and so the SNS topic) exists.
   FunctionErrorAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: HasAlertEmail
     Properties:
       AlarmDescription: Inventory Lambda invocation failed (crash/timeout).
       Namespace: AWS/Lambda
@@ -307,16 +389,20 @@ Resources:
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], !Ref "AWS::NoValue"]
 
   # Alarm 2: the function ran but one or more accounts could not be inventoried.
-  # Driven by a metric filter on the "ADMIN ACTION REQUIRED" log line.
+  # Driven by a metric filter anchored on the ERROR-level summary line
+  # "[ERROR]<tab><time><tab><request-id><tab>ADMIN ACTION REQUIRED -- ...", so an
+  # account name containing the marker on an [OK]/[ERR] line can't trigger it.
+  # A regex (%...%) with \s because CloudWatch regex patterns can't contain a
+  # literal space.
   AdminActionMetricFilter:
     Type: AWS::Logs::MetricFilter
     Condition: HasAlertEmail
     Properties:
       LogGroupName: !Ref LogGroup
-      FilterPattern: '"ADMIN ACTION REQUIRED"'
+      FilterPattern: '%^\[ERROR\]\s\S+\s\S+\sADMIN\sACTION\sREQUIRED\s--\s%'
       MetricTransformations:
         - MetricNamespace: !Ref MetricNamespace
           MetricName: AdminActionRequired

@@ -48,14 +48,21 @@ keys can't be inventoried by any API; see
    │                            GetAccessKeyLastUsed/                   │
    │                            ListServiceSpecificCredentials          │
    │                            (all read-only)                         │
-   │   Trust: <mgmt account> + condition aws:PrincipalOrgID = <org>     │
+   │   Trust: only <stack>-inventory-role in the mgmt account           │
+   │          (aws:PrincipalArn), from your org (aws:PrincipalOrgID)    │
    └────────────────────────────────────────────────────────────────────┘
 ```
 
-The Lambda tries each name in `CANDIDATE_ROLES` (default
-`OrgAccessKeyAuditRole,OrganizationAccountAccessRole,AWSControlTowerExecution`)
-and uses the first it can assume. Any account it cannot reach is recorded as an
-**error** (not silently skipped) and triggers admin alerting.
+The Lambda tries each name in `CANDIDATE_ROLES` (default `OrgAccessKeyAuditRole`)
+and uses the first it can assume. Every member session carries a read-only
+session policy (the four IAM read calls above) and lasts 15 minutes. The
+Lambda role's `sts:AssumeRole` grant follows the `CandidateRoles` parameter and
+only covers roles in your organization (`aws:ResourceOrgID`). The admin roles
+`OrganizationAccountAccessRole` and `AWSControlTowerExecution` are only tried
+(and only allowed) with `AllowAdminRoleFallback=true`
+(`ALLOW_ADMIN_ROLE_FALLBACK=true ./deploy.sh …`). Any account it cannot reach,
+including one without the audit role, is recorded as an **error** (not
+silently skipped) and triggers admin alerting.
 
 ---
 
@@ -71,6 +78,7 @@ and uses the first it can assume. Any account it cannot reach is recorded as an
 | `deploy-audit-role-stackset.sh`  | Deploy that role org-wide via a service-managed StackSet (IDs auto-discovered).   |
 | `destroy-audit-role-stackset.sh` | Remove that StackSet + roles from every member account (root ID auto-discovered). |
 | `tests/test_bedrock_keys.py`     | Offline unit tests (no AWS calls). See [Running the unit tests](#running-the-unit-tests). |
+| `SECURITY.md`                    | How to report a vulnerability privately.                                          |
 
 > **No account IDs are hardcoded anywhere.** The management account ID, org ID,
 > and org root are discovered at deploy time via `describe-organization` /
@@ -107,15 +115,40 @@ REGION=us-east-1        # IAM is global; a single region is fine
 
 # 2) Deploy the Lambda + bucket (+ optional alerting) stack
 #    deploy.sh PROMPTS for an alert email. Leave it blank for NO alerting,
-#    or provide one to create the SNS topic + alarms.
+#    or provide one to create the SNS topic + email alerts.
 ./deploy.sh "$PROFILE" "$REGION"
 ```
 
-> **Order matters.** Step 1 must finish before step 2 runs the Lambda: the
-> member role needs `iam:ListServiceSpecificCredentials` for the Bedrock API key
-> inventory. `deploy-audit-role-stackset.sh` waits for each StackSet operation
-> to reach `SUCCEEDED`, and exits non-zero if it ends `FAILED` or `STOPPED`
-> (it prints the `list-stack-set-operation-results` command to see why).
+> **Order matters.** For a **new deployment**, step 1 must finish before step 2
+> runs the Lambda: the member role needs `iam:ListServiceSpecificCredentials`
+> for the Bedrock API key inventory. `deploy-audit-role-stackset.sh` waits for
+> each StackSet operation to reach `SUCCEEDED`, and exits non-zero if it ends
+> `FAILED` or `STOPPED` (it prints the `list-stack-set-operation-results`
+> command to see why).
+>
+> **Updating an existing deployment:** run `deploy.sh` first (it creates the
+> Lambda role `<stack>-inventory-role`), then
+> `./deploy-audit-role-stackset.sh "$PROFILE" "$REGION" OrgAccessKeyAuditRole <stack>`,
+> because the member roles now trust only that role (`aws:PrincipalArn`). Runs
+> in between still work: the old member roles accept any management-account
+> principal from your org. In the other order (StackSet first), member
+> accounts fail with `AccessDenied` until `deploy.sh` finishes. Accounts that
+> were only reachable through `OrganizationAccountAccessRole` /
+> `AWSControlTowerExecution` become errors after `deploy.sh`, unless you set
+> `ALLOW_ADMIN_ROLE_FALLBACK=true`. `deploy.sh` also sets `CandidateRoles` from
+> `CANDIDATE_ROLES` (default `OrgAccessKeyAuditRole`), so set it again if your
+> stack used a custom list.
+
+Stack names:
+
+- A non-default stack name must also be passed to the StackSet script, as its
+  4th argument, so the member roles trust `<stack>-inventory-role`.
+- Stack names can be at most 49 characters (`<stack>-inventory-role` must fit
+  IAM's 64-character limit); `deploy.sh` stops before any AWS call otherwise.
+- IAM role names are global, so one account can hold a given stack name in only
+  one region.
+- `deploy.sh` deploys with `--capabilities CAPABILITY_NAMED_IAM`, because the
+  Lambda role has a fixed name.
 
 `deploy.sh` will prompt:
 
@@ -124,9 +157,11 @@ Alert email address (optional):
 ```
 
 - **Leave blank** → the stack is deployed with **no SNS topic, no subscription,
-  and no CloudWatch alarms**. Errors still appear in the return payload and the
-  CloudWatch logs (`RUN SUMMARY` / `ADMIN ACTION REQUIRED`).
-- **Enter an email** → an SNS topic, email subscription, and alarms are created.
+  and no `AdminActionAlarm`**. `FunctionErrorAlarm` is still created, without a
+  notification. Errors still appear in the return payload and the CloudWatch
+  logs (`RUN SUMMARY` / `ADMIN ACTION REQUIRED`).
+- **Enter an email** → an SNS topic, email subscription, and `AdminActionAlarm`
+  are created, and `FunctionErrorAlarm` notifies the topic.
   **AWS then emails you a one-time "Confirm subscription" link that you must
   click**, or no alerts will be delivered. `deploy.sh` prints this reminder too.
 
@@ -165,25 +200,44 @@ You can also pass both non-interactively — email as the 4th arg, schedule as t
 REPORT_PREFIX=my-reports ./deploy.sh "$PROFILE" "$REGION" org-access-key-inventory "" none
 
 # or drive CloudFormation directly (after deploy.sh has packaged the code).
-# Pass Prefix explicitly: parameters you leave out keep their previous values.
+# Pass Prefix, CandidateRoles and AllowAdminRoleFallback explicitly: parameters
+# you leave out keep their previous values.
 aws cloudformation deploy --template-file packaged.yaml \
-  --stack-name org-access-key-inventory --capabilities CAPABILITY_IAM \
+  --stack-name org-access-key-inventory --capabilities CAPABILITY_NAMED_IAM \
   --profile "$PROFILE" --region "$REGION" \
   --parameter-overrides \
       AlertEmail=you@example.com \
       EnableSchedule=true ScheduleExpression="rate(1 day)" \
-      Prefix=credential-inventory
+      Prefix=credential-inventory \
+      CandidateRoles=OrgAccessKeyAuditRole AllowAdminRoleFallback=false
 ```
 
 `deploy.sh` always passes `Prefix` (from `REPORT_PREFIX`, default
 `credential-inventory`), because `cloudformation deploy` would otherwise keep an
 existing stack's previous `Prefix`. `LEGACY_REPORT_PREFIX` is only needed if an
 older deployment wrote its reports under a custom root instead of
-`access-key-reports`.
+`access-key-reports`. For the same reason it always passes `CandidateRoles`
+(from `CANDIDATE_ROLES`, default `OrgAccessKeyAuditRole`) and
+`AllowAdminRoleFallback` (from `ALLOW_ADMIN_ROLE_FALLBACK`, default `false`):
+
+```bash
+# also try the admin roles in accounts without the audit role (sessions stay read-only)
+ALLOW_ADMIN_ROLE_FALLBACK=true ./deploy.sh "$PROFILE" "$REGION"
+```
+
+The Lambda code is uploaded to the artifact bucket
+`access-key-audit-artifacts-<account>-<region>`. Its name is predictable, so
+`deploy.sh` uses it only after `--expected-bucket-owner` confirms your account
+owns it, and stops otherwise (checked again right before the upload). On every
+deploy it also keeps that bucket private (all Block Public Access settings),
+versioned, ACL-free (`BucketOwnerEnforced`) and TLS-only (bucket policy), and
+removes `lambda/__pycache__` before packaging.
 
 > **Email confirmation is required.** If you set `AlertEmail`, click the
 > "Confirm subscription" link in the email AWS sends you (one-time), or alerts
-> won't be delivered. With no email, no SNS resources are created at all.
+> won't be delivered. With no email, no SNS topic, subscription or
+> `AdminActionAlarm` is created; `FunctionErrorAlarm` still exists, without
+> notifications.
 
 ---
 
@@ -348,11 +402,17 @@ aws s3 cp "s3://$BUCKET/credential-inventory/runs/2026/09/08/20260908T063802Z/ac
 | `run_id`                     | The run that produced the row (UTC, e.g. `20260908T063802Z`); the same on every row and in the run folder name.                                                             |
 | `account_id`, `account_name` | Owning account.                                                                                                                                                             |
 | `user`                       | IAM user name.                                                                                                                                                              |
-| `access_key_id`              | The `AKIA...` key ID, **masked** to first/last 4 chars (e.g. `AKIA************MPLE`). No secret is ever exposed. Tune with `MaskHead`/`MaskTail` (both `0` = show full id). |
+| `access_key_id`              | The `AKIA...` key ID, **masked** to first/last 4 chars (e.g. `AKIA************MPLE`). No secret is ever exposed. Tune with `MaskHead`/`MaskTail` (0-8 each; `MaskTail=0` hides the tail; if head + tail would cover the whole ID it is fully masked; both `0` = show the full ID, opt-in). |
 | `status`                     | `Active` / `Inactive`.                                                                                                                                                      |
 | `create_date`                | **True key creation timestamp** (from `ListAccessKeys`).                                                                                                                    |
 | `age_days`                   | Age of the key in days (rotation signal).                                                                                                                                   |
 | `last_used`                  | Last-used timestamp; `Never` if IAM has no record of the key being used; `Unknown` if the last-used lookup failed (logged as a WARNING).                                     |
+
+In both CSVs, text cells that start with `=`, `+`, `-`, `@`, a tab or a carriage
+return get a leading `'` (for example an account name `=HYPERLINK(…)` is written
+as `'=HYPERLINK(…)`), so spreadsheets show them as text instead of running a
+formula. Numbers are written as-is; the state, changelogs and manifests keep the
+raw values.
 
 ---
 
@@ -553,10 +613,12 @@ aws cloudformation describe-stacks --stack-name org-access-key-inventory \
 ### History (change detection)
 
 To know _what changed_, the Lambda keeps a small state file at
-`s3://<bucket>/<prefix>/state/access-keys.json`. It maps **hashed** key
-identifiers (`sha256(account_id:access_key_id)`, so no raw key ID is persisted)
-to lightweight descriptors (account, user, masked key ID, status, create date),
-and records which accounts have ever been listed successfully:
+`s3://<bucket>/<prefix>/state/access-keys.json`. It maps pseudonymous key
+identifiers (`sha256(account_id:access_key_id)`) to lightweight descriptors
+(account, user, masked key ID, status, create date), and records which accounts
+have ever been listed successfully. The raw key ID isn't stored, but the
+identifier is not a secret: key IDs encode their account, so anyone who can
+read `state/` can likely recover the raw ID. Protect `state/` like the CSVs.
 
 ```json
 {
@@ -644,9 +706,9 @@ before. Check the `create_date` of the listed accounts' keys in the CSV.
 **Bedrock API keys** have their own, independent history with the same logic:
 
 - state: `s3://<bucket>/<prefix>/state/bedrock-api-keys.json` (same v2 format),
-  keyed by `sha256(account_id:credential_id)` with descriptors `account_id,
-  account_name, user, credential_id (masked), service_name, status,
-  create_date, expiration_date`; legacy fallback:
+  keyed by the pseudonymous `sha256(account_id:credential_id)` (as above) with
+  descriptors `account_id, account_name, user, credential_id (masked),
+  service_name, status, create_date, expiration_date`; legacy fallback:
   `<LegacyPrefix>/bedrock-api-keys/state/keys-state.json`;
 - changelog: `runs/YYYY/MM/DD/<run-id>/changes-bedrock-api-keys.json`
   (same shape as above, with `credential_id` instead of `access_key_id`, plus
@@ -801,24 +863,27 @@ attention**, three independent ways:
    - Final line: `RUN SUMMARY: status=... accounts_scanned=... keys_found=...
      errors=... report=<uri|none>` (plus `bedrock_keys_found=... bedrock_errors=...
      bedrock_report=...`), then `run_id=... manifest=<uri|none> write_errors=<n>`.
-   - On failure the summary is logged at **ERROR** with the marker
-     **`ADMIN ACTION REQUIRED`** — easy to search or alarm on:
+   - On failure the summary is logged at **ERROR**, prefixed with the marker
+     **`ADMIN ACTION REQUIRED --`** — easy to search or alarm on:
      ```bash
      aws logs filter-log-events --log-group-name "/aws/lambda/<stack>-inventory" \
        --filter-pattern '"ADMIN ACTION REQUIRED"' --profile "$PROFILE" --region "$REGION"
      ```
 
 3. **SNS alerts** — created **only if you provided an `AlertEmail`** at deploy
-   time (with no email, none of the SNS/alarm resources below exist). When
-   enabled, the topic `AlertTopic` (output `AlertTopicArn`) fires to your
-   `AlertEmail` in two cases:
+   time (with no email there is no SNS topic, subscription or
+   `AdminActionAlarm`; `FunctionErrorAlarm` still exists, without
+   notifications). When enabled, the topic `AlertTopic` (output
+   `AlertTopicArn`) fires to your `AlertEmail` in two cases:
    - **`AdminActionAlarm`** — the run completed but ≥1 account could not be
      inventoried, its Bedrock API keys could not be listed, or a report/state
-     file could not be written to S3 (metric filter on the
-     `ADMIN ACTION REQUIRED` log line). The Lambda also publishes a detailed
-     message listing the failing accounts or files and the fix.
+     file could not be written to S3 (metric filter on the ERROR-level
+     `ADMIN ACTION REQUIRED --` summary line only, so an account name that
+     contains the marker can't trigger it). The Lambda also publishes a
+     detailed message listing the failing accounts or files and the fix.
    - **`FunctionErrorAlarm`** — the Lambda invocation itself crashed or timed out
-     (`AWS/Lambda Errors > 0`).
+     (`AWS/Lambda Errors > 0`; the function times out after 15 minutes). This
+     alarm is always created and notifies only when `AlertEmail` is set.
 
 ### Bedrock-only failures
 
@@ -864,7 +929,8 @@ accounts):
 
 | Cause                                                                                                          | Fix                                                                                                                                             |
 | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| Account has none of the candidate roles (e.g. an **invited** account with no `OrganizationAccountAccessRole`). | Deploy `OrgAccessKeyAuditRole` there — via the StackSet (auto for org members) or hand the owner `member-audit-role.yaml` to deploy standalone. |
+| Account has no `OrgAccessKeyAuditRole` (StackSet instance missing or failed, account not targeted, or an **invited** account).        | Deploy the role there — via the StackSet (auto for org members) or hand the owner `member-audit-role.yaml` to deploy standalone with `TrustedAccountId`, `OrgId` and `InventoryRoleName` set. Last resort: `AllowAdminRoleFallback=true` (sessions stay read-only). |
+| Every member account fails with `AccessDenied` on `AssumeRole`.                                                | The member roles trust a different `InventoryRoleName`, or `deploy.sh` hasn't created `<stack>-inventory-role` yet: run `deploy.sh`, then `./deploy-audit-role-stackset.sh "$PROFILE" "$REGION" OrgAccessKeyAuditRole <stack>` with the same stack name. If those match, check the `aws:ResourceOrgID` condition on the function role's `sts:AssumeRole` statement (CloudTrail shows the denied `AssumeRole` call). |
 | An SCP denies `sts:AssumeRole` / IAM reads.                                                                    | Adjust the SCP to allow the audit role.                                                                                                         |
 | Account is suspended / being closed.                                                                           | Usually safe to ignore.                                                                                                                         |
 | `bedrock.errors[]` shows `AccessDenied` (on `ListServiceSpecificCredentials`).                                 | The member role predates Bedrock support. Re-run `./deploy-audit-role-stackset.sh`, wait for `SUCCEEDED`, then re-run the Lambda. If it persists, check SCPs for a deny on `iam:ListServiceSpecificCredentials`. |
@@ -911,50 +977,81 @@ Run whichever you need. To remove **everything**, run both (order doesn't matter
 > `destroy.sh` prints a reminder about step 2, so you won't forget the role is
 > still deployed in your member accounts.
 
-For a **full clean slate**, also empty and delete the retained buckets (the
-report bucket is versioned, so `--force` removes versions too):
+Both scripts ask you to type the stack name (`org-access-key-inventory` by
+default) or the StackSet name (`org-access-key-audit-role`) to confirm; no input
+aborts. `FORCE=1` skips the prompt (e.g. `FORCE=1 ./destroy.sh "$PROFILE" "$REGION"`).
+If deleting the stack instances ends `FAILED` or `STOPPED`,
+`destroy-audit-role-stackset.sh` keeps the StackSet, prints the
+`list-stack-set-operation-results` command, and exits non-zero.
+
+For a **full clean slate**, also delete the retained report bucket. It is
+versioned, so `aws s3 rb --force` alone fails: it doesn't delete object
+versions. Empty it first in the S3 console (select the bucket, choose
+**Empty**, which also deletes all versions), then remove it:
 
 ```bash
-ACCOUNT_ID=$(aws sts get-caller-identity --profile "$PROFILE" --query Account --output text)
 REPORT=$(aws cloudformation describe-stacks --stack-name org-access-key-inventory \
   --profile "$PROFILE" --region "$REGION" \
   --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" --output text 2>/dev/null)
 
 # (run BEFORE destroy.sh if you want the report bucket name from the stack outputs)
-aws s3 rb "s3://$REPORT" --force --profile "$PROFILE"   # report bucket (retained)
-aws s3 rb "s3://access-key-audit-artifacts-${ACCOUNT_ID}-${REGION}" --force --profile "$PROFILE"
+aws s3 rb "s3://$REPORT" --profile "$PROFILE"   # report bucket (retained), once emptied
 ```
+
+> **Keep the artifact bucket** `access-key-audit-artifacts-<account>-<region>`
+> (it only holds the packaged Lambda zips). Its name is predictable: if you
+> delete it, anyone could claim the name, and `deploy.sh` would then refuse to
+> deploy in that region.
 
 ---
 
 ## Security notes
 
-- The Lambda role is **least-privilege**: `organizations:ListAccounts`,
-  `sts:AssumeRole` only on the three specific audit-role ARNs, read-only IAM in
-  the management account, `s3:PutObject`/`s3:GetObject` only on the report bucket
-  (the latter to read the small history state file), `cloudwatch:PutMetricData`
-  restricted to the `MetricNamespace` via an IAM condition, and `sns:Publish`
-  only to the alert topic. It has no `s3:DeleteObject` or `s3:ListBucket`, so it
-  can't remove or move old reports (including the legacy `access-key-reports/`
-  objects it reads once when moving from the old layout).
-- The history state, changelogs and manifests store **masked** key IDs, S3 URIs
-  and a one-way `sha256` of `account_id:access_key_id` as the identifier — no
-  raw key IDs and never any secret keys.
-- The member-account role is **read-only** (`ListUsers`, `ListAccessKeys`,
-  `GetAccessKeyLastUsed`, `ListServiceSpecificCredentials`) and trusts **only**
-  the management account **and** only principals from your org
-  (`aws:PrincipalOrgID` condition).
+- **Lambda role.** `organizations:ListAccounts`; `sts:AssumeRole` only on the
+  `CandidateRoles` names (default `OrgAccessKeyAuditRole`) and only for roles
+  in your organization (`aws:ResourceOrgID` = `${aws:PrincipalOrgID}`);
+  read-only IAM in the management account; `s3:PutObject`/`s3:GetObject` on the
+  report bucket (the latter to read the small history state file);
+  `cloudwatch:PutMetricData` limited to the `MetricNamespace` by an IAM
+  condition; `sns:Publish` only to the alert topic. It has no `s3:DeleteObject`
+  or `s3:ListBucket`, so it can't remove or move old reports (including the
+  legacy `access-key-reports/` objects it reads once when moving from the old
+  layout).
+- **Member sessions.** Every `AssumeRole` call passes an inline session policy
+  that allows only `iam:ListUsers`, `iam:ListAccessKeys`,
+  `iam:GetAccessKeyLastUsed` and `iam:ListServiceSpecificCredentials`, and
+  sessions last 15 minutes.
+- **Admin roles are opt-in.** `OrganizationAccountAccessRole` and
+  `AWSControlTowerExecution` are only tried with `AllowAdminRoleFallback=true`;
+  without it the Lambda role explicitly denies assuming them, even if they are
+  listed in `CandidateRoles`. With it on, sessions are still limited by the
+  session policy, but anyone who can change the function's code or
+  configuration (or pass its role to other compute) could act with the role's
+  permissions: restrict `lambda:Update*` and `iam:PassRole` on it.
+- **Member role trust.** The member-account role is **read-only** (the same four
+  calls) and trusts only the inventory role ARN in the management account
+  (`aws:PrincipalArn`), and only from your org (`aws:PrincipalOrgID`).
+- **IDs, not secrets.** Reports, state, changelogs and manifests hold key IDs and
+  metadata only, never secret keys. Masking only hides IDs from casual readers.
+  The `sha256(account_id:key_id)` state identifier is pseudonymous: anyone who
+  can read `state/` can likely recover the full key ID.
 - For Bedrock API keys the Lambda reads **metadata only**. It never calls
   `CreateServiceSpecificCredential` or `ResetServiceSpecificCredential` (the
   calls that return a secret), never stores the credential alias, masks
-  credential IDs, and stores only a `sha256(account_id:credential_id)` as the
-  state identifier.
-- The report contains key **IDs and metadata only — never secret keys**. The
-  bucket is private (all public access blocked), encrypted (SSE-S3), and
-  versioned. The lifecycle rules only expire **noncurrent** versions under
-  `latest/` and `state/` (after 30 days); run folders and current versions are
-  never expired.
-- Consider restricting who can read the report bucket via a bucket policy/SCP.
+  credential IDs, and uses the pseudonymous `sha256(account_id:credential_id)`
+  as the state identifier.
+- **Report bucket.** All four Block Public Access settings, encrypted (SSE-S3),
+  versioned, ACLs disabled (`BucketOwnerEnforced`), and a bucket policy that
+  denies requests without TLS. The lifecycle rules only expire **noncurrent**
+  versions under `latest/` and `state/` (after 30 days); run folders and
+  current versions are never expired. Consider restricting who can read the
+  report bucket via a bucket policy/SCP.
+- **CSV cells** that a spreadsheet would run as a formula (starting with `=`,
+  `+`, `-`, `@`, tab or CR) are prefixed with `'`.
+- **Artifact bucket.** `deploy.sh` uploads the Lambda code only after
+  `--expected-bucket-owner` confirms your account owns the bucket, and keeps it
+  private, versioned, ACL-free and TLS-only.
+- Report vulnerabilities privately: see [`SECURITY.md`](./SECURITY.md).
 
 ---
 
@@ -973,6 +1070,12 @@ With botocore ≥ 1.39.0 every test runs. With an older botocore the two
 against that older IAM model instead. `PYTHONDONTWRITEBYTECODE=1` keeps
 `__pycache__` out of `tests/` (the test module already keeps it out of `lambda/`,
 which `cloudformation package` zips as-is).
+
+The tests also read `template.yaml`, `member-audit-role.yaml` and the four
+scripts as text, so an edit that undoes the hardening fails them (member-role
+trust and grants, artifact-bucket ownership checks, destroy prompts, and
+similar). The scripts are never run whole: only short AWS-free snippets run in
+`bash`, with a fake `aws` that fails if called.
 
 ---
 

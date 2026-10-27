@@ -1,8 +1,11 @@
-"""Unit tests for the org inventory Lambda: Bedrock API keys and the
-run-centric S3 layout (run folders, manifests, latest/, state, legacy fallback).
+"""Unit tests for the org inventory Lambda: Bedrock API keys, the
+run-centric S3 layout (run folders, manifests, latest/, state, legacy fallback),
+and the security hardening (member roles, masking, CSV cells, alarm filter, and
+text checks of the templates and deploy/destroy scripts).
 
 No AWS calls and no network: every client is a botocore Stubber or a mock, and
-any real HTTP send fails the test. Run from the repo root:
+any real HTTP send fails the test. The scripts are only syntax-checked or have
+small AWS-free snippets run with a stubbed `aws`. Run from the repo root:
 
     PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 """
@@ -19,6 +22,10 @@ import logging  # noqa: E402
 import os  # noqa: E402
 import pathlib  # noqa: E402
 import re  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+import textwrap  # noqa: E402
 import unittest  # noqa: E402
 from datetime import datetime, timedelta, timezone  # noqa: E402
 from unittest import mock  # noqa: E402
@@ -36,9 +43,9 @@ os.environ.update({
     "AWS_SHARED_CREDENTIALS_FILE": os.devnull,
 })
 for _var in ("AWS_PROFILE", "AWS_SESSION_TOKEN", "ALERT_TOPIC_ARN", "CANDIDATE_ROLES",
-             "METRIC_NAMESPACE", "STALE_AGE_DAYS", "PUBLISH_METRICS", "MASK_HEAD",
-             "MASK_TAIL", "INCLUDE_BEDROCK_KEYS", "BEDROCK_EXPIRY_WARN_DAYS",
-             "LEGACY_PREFIX"):
+             "ALLOW_ADMIN_ROLE_FALLBACK", "METRIC_NAMESPACE", "STALE_AGE_DAYS",
+             "PUBLISH_METRICS", "MASK_HEAD", "MASK_TAIL", "INCLUDE_BEDROCK_KEYS",
+             "BEDROCK_EXPIRY_WARN_DAYS", "LEGACY_PREFIX"):
     os.environ.pop(_var, None)
 
 import botocore  # noqa: E402
@@ -1499,6 +1506,596 @@ class CoverageTests(HandlerTestCase):
                          [_baselined(MEMBER, 0)])
         self.assertNotIn(f"{RUN_PREFIX}/changes-access-keys.json", s3.put_keys())
         self.assertIsNone(result["history_location"])
+
+
+# ---------------------------------------------------------------------------
+# Security hardening: member roles, masking, CSV injection, alarm filter
+# ---------------------------------------------------------------------------
+ADMIN_ROLES = ["OrganizationAccountAccessRole", "AWSControlTowerExecution"]
+OLD_DEFAULT_ROLES = "OrgAccessKeyAuditRole,OrganizationAccountAccessRole,AWSControlTowerExecution"
+
+
+def _fresh_module(env):
+    """A separate copy of lambda_function imported under `env` (module-level
+    settings are read at import time). The shared `lf` is left untouched."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "lambda_function_fresh", REPO / "lambda" / "lambda_function.py")
+    mod = importlib.util.module_from_spec(spec)
+    with mock.patch.dict(os.environ, env):
+        spec.loader.exec_module(mod)
+    return mod
+
+
+class MemberRoleTests(NoNetworkTestCase):
+    def test_module_defaults_exclude_admin_roles(self):
+        self.assertEqual(lf.CANDIDATE_ROLES, ["OrgAccessKeyAuditRole"])
+        self.assertIs(lf.ALLOW_ADMIN_ROLE_FALLBACK, False)
+        self.assertEqual(lf._IGNORED_ADMIN_ROLES, [])
+
+    def test_candidate_roles(self):
+        cases = [
+            (("", False), (["OrgAccessKeyAuditRole"], [])),
+            ((" , ", False), (["OrgAccessKeyAuditRole"], [])),
+            ((None, False), (["OrgAccessKeyAuditRole"], [])),
+            (("A, B", False), (["A", "B"], [])),
+            ((OLD_DEFAULT_ROLES, False), (["OrgAccessKeyAuditRole"], ADMIN_ROLES)),
+            (("OrganizationAccountAccessRole", False),
+             (["OrgAccessKeyAuditRole"], ["OrganizationAccountAccessRole"])),
+            (("OrgAccessKeyAuditRole", True), (["OrgAccessKeyAuditRole"] + ADMIN_ROLES, [])),
+            (("AWSControlTowerExecution,OrgAccessKeyAuditRole", True),
+             (["AWSControlTowerExecution", "OrgAccessKeyAuditRole",
+               "OrganizationAccountAccessRole"], [])),
+        ]
+        for args, expected in cases:
+            with self.subTest(args=args):
+                self.assertEqual(lf._candidate_roles(*args), expected)
+
+    def test_env_at_import(self):
+        cases = [
+            ({"CANDIDATE_ROLES": ""}, ["OrgAccessKeyAuditRole"], []),
+            ({"CANDIDATE_ROLES": " , "}, ["OrgAccessKeyAuditRole"], []),
+            ({"CANDIDATE_ROLES": OLD_DEFAULT_ROLES}, ["OrgAccessKeyAuditRole"], ADMIN_ROLES),
+            ({"ALLOW_ADMIN_ROLE_FALLBACK": "TRUE"}, ["OrgAccessKeyAuditRole"] + ADMIN_ROLES, []),
+            ({"ALLOW_ADMIN_ROLE_FALLBACK": "yes"}, ["OrgAccessKeyAuditRole"], []),
+        ]
+        for env, roles, ignored in cases:
+            with self.subTest(env=env):
+                mod = _fresh_module(env)
+                self.assertEqual(mod.CANDIDATE_ROLES, roles)
+                self.assertEqual(mod._IGNORED_ADMIN_ROLES, ignored)
+
+    def test_ignored_admin_roles_logged_once_per_run(self):
+        with mock.patch.object(lf, "_IGNORED_ADMIN_ROLES", ADMIN_ROLES), \
+                self.assertLogs(level="INFO") as logs:
+            _run_handler()
+        warnings = [r.getMessage() for r in logs.records
+                    if r.levelno == logging.WARNING and "CANDIDATE_ROLES" in r.getMessage()]
+        self.assertEqual(warnings, [
+            "Ignoring OrganizationAccountAccessRole, AWSControlTowerExecution in "
+            "CANDIDATE_ROLES: admin roles are only tried when ALLOW_ADMIN_ROLE_FALLBACK=true"])
+
+    def test_session_policy_is_read_only(self):
+        self.assertEqual(json.loads(lf._SESSION_POLICY), {
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow",
+                           "Action": ["iam:ListUsers", "iam:ListAccessKeys",
+                                      "iam:GetAccessKeyLastUsed",
+                                      "iam:ListServiceSpecificCredentials"],
+                           "Resource": "*"}]})
+        self.assertLessEqual(len(lf._SESSION_POLICY), 2048)  # STS inline policy limit
+        self.assertEqual(lf._SESSION_SECONDS, 900)
+
+    @staticmethod
+    def _creds():
+        return {"Credentials": {"AccessKeyId": "ASIAEXAMPLE", "SecretAccessKey": "x",
+                                "SessionToken": "t"}}
+
+    def _assume_call(self, role):
+        return mock.call(RoleArn=f"arn:aws:iam::{MEMBER}:role/{role}",
+                         RoleSessionName="AccessKeyAudit", Policy=lf._SESSION_POLICY,
+                         DurationSeconds=900)
+
+    def test_member_iam_uses_session_policy(self):
+        sts, session = mock.MagicMock(), mock.MagicMock()
+        sts.assume_role.return_value = self._creds()
+        with mock.patch.object(lf, "CANDIDATE_ROLES", ["OrgAccessKeyAuditRole"]):
+            client, role = lf._member_iam(sts, session, MEMBER)
+        self.assertEqual(sts.assume_role.call_args_list, [self._assume_call("OrgAccessKeyAuditRole")])
+        self.assertEqual(role, "OrgAccessKeyAuditRole")
+        self.assertIs(client, session.client.return_value)
+        session.client.assert_called_once_with(
+            "iam", aws_access_key_id="ASIAEXAMPLE", aws_secret_access_key="x",
+            aws_session_token="t", config=lf.RETRY_CFG)
+
+    def test_member_iam_falls_through_to_next_role(self):
+        sts, session = mock.MagicMock(), mock.MagicMock()
+        sts.assume_role.side_effect = [_client_error("AccessDenied", "AssumeRole"), self._creds()]
+        with mock.patch.object(lf, "CANDIDATE_ROLES", ["R1", "R2"]):
+            _, role = lf._member_iam(sts, session, MEMBER)
+        self.assertEqual(role, "R2")
+        self.assertEqual(sts.assume_role.call_args_list,
+                         [self._assume_call("R1"), self._assume_call("R2")])
+
+    def test_member_iam_raises_last_error(self):
+        sts = mock.MagicMock()
+        last = _client_error("NoSuchEntity", "AssumeRole")
+        sts.assume_role.side_effect = [_client_error("AccessDenied", "AssumeRole"), last]
+        with mock.patch.object(lf, "CANDIDATE_ROLES", ["R1", "R2"]):
+            with self.assertRaises(ClientError) as ctx:
+                lf._member_iam(sts, mock.MagicMock(), MEMBER)
+        self.assertIs(ctx.exception, last)
+
+    def test_member_iam_no_roles_is_account_error(self):
+        sts = mock.MagicMock()
+        with mock.patch.object(lf, "CANDIDATE_ROLES", []):
+            with self.assertRaises(ClientError) as ctx:
+                lf._member_iam(sts, mock.MagicMock(), MEMBER)
+        self.assertEqual(lf._err_code(ctx.exception), "NoCandidateRoles")
+        sts.assume_role.assert_not_called()
+
+
+class MaskTests(unittest.TestCase):
+    KID = "AKIAIOSFODNN7EXAMPLE"  # AWS's documented example id (20 chars)
+
+    def test_mask_widths(self):
+        k = self.KID
+        cases = [
+            ((4, 4), "AKIA" + "*" * 12 + "MPLE"),
+            ((4, 0), "AKIA" + "*" * 16),  # kid[-0:] used to reveal the whole id
+            ((0, 4), "*" * 16 + "MPLE"),
+            ((0, 0), k),                   # documented opt-in: full id
+            ((8, 8), k[:8] + "****" + k[-8:]),
+            ((10, 10), "*" * 20),          # head + tail covers the id: mask all
+            ((16, 8), "*" * 20),
+        ]
+        for (head, tail), expected in cases:
+            with self.subTest(head=head, tail=tail), \
+                    mock.patch.multiple(lf, _MASK_HEAD=head, _MASK_TAIL=tail):
+                self.assertEqual(lf._mask(k), expected)
+
+    def test_mask_empty(self):
+        self.assertEqual(lf._mask(""), "")
+        self.assertIsNone(lf._mask(None))
+
+    def test_nonneg_int_env(self):
+        with mock.patch.dict(os.environ, {"X_TEST": "-4"}):
+            self.assertEqual(lf._nonneg_int_env("X_TEST", 4), 0)
+        with mock.patch.dict(os.environ, {"X_TEST": "6"}):
+            self.assertEqual(lf._nonneg_int_env("X_TEST", 4), 6)
+        os.environ.pop("X_TEST", None)
+        self.assertEqual(lf._nonneg_int_env("X_TEST", 4), 4)
+
+    def test_negative_env_never_reveals_more(self):
+        mod = _fresh_module({"MASK_HEAD": "-4", "MASK_TAIL": "4"})
+        self.assertEqual((mod._MASK_HEAD, mod._MASK_TAIL), (0, 4))
+        self.assertEqual(mod._mask(self.KID), "*" * 16 + "MPLE")
+
+
+class CsvInjectionTests(NoNetworkTestCase):
+    def test_csv_safe(self):
+        for v in ("=1+1", "+1", "-1", "@SUM(A1)", "\tx", "\rx"):
+            with self.subTest(v=v):
+                self.assertEqual(lf._csv_safe(v), "'" + v)
+        for v in ("dev", "", "AKIA****MPLE", "****MPLE", "2026-09-08T06:38:02+00:00",
+                  "Never", -5, 0):
+            with self.subTest(v=v):
+                self.assertEqual(lf._csv_safe(v), v)
+
+    def test_bedrock_csv_cells(self):
+        name = '=HYPERLINK("https://x.example/?"&E2,"Fix")'
+        row = {"account_id": MEMBER, "account_name": name, "user": "@evil",
+               "credential_id": "ACCA****C003", "service_name": SVC, "status": "Expired",
+               "create_date": "2026-09-01T00:00:00+00:00", "age_days": 7,
+               "expiration_date": "2026-09-05T00:00:00+00:00", "days_to_expiry": -3,
+               "never_expires": "false", "user_active_access_keys": 0}
+        body = lf._csv_bytes([row], lf.BEDROCK_FIELDS, RUN_ID).decode("utf-8")
+        (parsed,) = list(csv.DictReader(io.StringIO(body)))
+        self.assertEqual(parsed["account_name"], "'" + name)
+        self.assertEqual(parsed["user"], "'@evil")
+        self.assertEqual(parsed["days_to_expiry"], "-3")
+        self.assertEqual(parsed["age_days"], "7")
+        self.assertEqual(parsed["run_id"], RUN_ID)
+        self.assertEqual(parsed["credential_id"], "ACCA****C003")
+
+    def test_access_csv_neutralized_but_state_raw(self):
+        mgmt = _fake_iam(users=["=cmd"], access_keys={"=cmd": [_access_key(RAW_ACCESS_KEYS[0])]})
+        with self.assertLogs(level="INFO"):
+            _, s3, _, _ = _run_handler(mgmt_iam=mgmt, now=RUN_NOW)
+        _, body = s3.body(ACCESS_CSV_RE)
+        rows = list(csv.DictReader(io.StringIO(body)))
+        mgmt_rows = [r for r in rows if r["account_id"] == MGMT]
+        self.assertEqual([r["user"] for r in mgmt_rows], ["'=cmd"])
+        self.assertEqual(mgmt_rows[0]["access_key_id"], lf._mask(RAW_ACCESS_KEYS[0]))
+        stored = [e for e in s3.json(ACCESS_STATE_KEY)["keys"].values()
+                  if e["account_id"] == MGMT]
+        self.assertEqual([e["user"] for e in stored], ["=cmd"])
+
+
+class AdminAlarmFilterTests(NoNetworkTestCase):
+    """The AdminActionRequired metric filter (template.yaml) vs Lambda text logs."""
+    RID = "1c8df7d3-0000-4000-8000-0000abcdef01"
+
+    def setUp(self):
+        super().setUp()
+        text = (REPO / "template.yaml").read_text()
+        m = re.search(r"FilterPattern: '%(.+)%'", text)
+        self.assertIsNotNone(m, "regex FilterPattern not found in template.yaml")
+        self.rx = re.compile(m.group(1))
+
+    def _line(self, level, message):
+        # The Lambda Python runtime's plain-text log line format.
+        return f"[{level}]\t2026-09-08T06:38:02.123Z\t{self.RID}\t{message}\n"
+
+    def _matching_records(self, logs):
+        return [r for r in logs.records
+                if self.rx.search(self._line(r.levelname, r.getMessage()))]
+
+    def test_matches_only_the_error_summary(self):
+        with self.assertLogs(level="INFO") as logs:
+            _run_handler(member_assume_error=_client_error("AccessDenied", "AssumeRole"))
+        (hit,) = self._matching_records(logs)
+        self.assertEqual(hit.levelname, "ERROR")
+        self.assertTrue(hit.getMessage().startswith("ADMIN ACTION REQUIRED -- RUN SUMMARY:"))
+
+    def test_forged_account_names_do_not_match(self):
+        for level, msg in (
+                ("INFO", "[OK]  222222222222 ADMIN ACTION REQUIRED -- x keys=1 via "
+                         "OrgAccessKeyAuditRole"),
+                ("ERROR", "[ERR] 222222222222 ADMIN ACTION REQUIRED -- x could not be "
+                          "inventoried: AccessDenied"),
+                ("INFO", "ADMIN ACTION REQUIRED -- RUN SUMMARY: status=OK")):
+            with self.subTest(level=level, msg=msg):
+                self.assertIsNone(self.rx.search(self._line(level, msg)))
+
+    def test_clean_run_does_not_match(self):
+        with self.assertLogs(level="INFO") as logs:
+            _run_handler()
+        self.assertEqual(self._matching_records(logs), [])
+
+    def test_uses_only_cloudwatch_regex_syntax(self):
+        # CloudWatch Logs regex patterns allow only alphanumerics, the symbols
+        # : _ # = @ / ; , - and the operators ^ $ ? [ ] { } | \ * + . -- no
+        # spaces, no parentheses. Anything else is rejected at deploy time.
+        self.assertRegex(self.rx.pattern, r"^[A-Za-z0-9:_#=@/;,\-^$?\[\]{}|\\*+.]+$")
+
+
+# ---------------------------------------------------------------------------
+# Template and script guards: text checks, so a later edit can't silently undo
+# the hardening. No YAML library and no AWS; the scripts are never run whole.
+# ---------------------------------------------------------------------------
+ADMIN_ROLE_ARNS = [f"arn:aws:iam::*:role/{r}" for r in ADMIN_ROLES]
+ORG_SCOPE = 'aws:ResourceOrgID: "${aws:PrincipalOrgID}"'
+SCRIPTS = ("deploy.sh", "destroy.sh", "deploy-audit-role-stackset.sh",
+           "destroy-audit-role-stackset.sh")
+BASH = shutil.which("bash")
+
+
+def _text(name):
+    return (REPO / name).read_text()
+
+
+def _yaml_block(text, key):
+    """The lines of the YAML entry `key:` (key includes its indent, e.g.
+    "  FunctionRole") up to the next line at the same or a lower indent."""
+    lines = text.splitlines()
+    indent = len(key) - len(key.lstrip())
+    starts = [i for i, line in enumerate(lines) if line.startswith(key + ":")]
+    if len(starts) != 1:
+        raise AssertionError(f"{key.strip()}: expected one entry, found {len(starts)}")
+    end = starts[0] + 1
+    while end < len(lines) and (not lines[end].strip()
+                                or len(lines[end]) - len(lines[end].lstrip()) > indent):
+        end += 1
+    return "\n".join(lines[starts[0]:end]) + "\n"
+
+
+def _statements(policy_block):
+    """{Sid: text} for every `- Sid:` statement in a policy block."""
+    chunks = re.split(r"\n(?=[ ]*- Sid: )", policy_block)[1:]
+    return {re.match(r"\s*- Sid: (\w+)", c).group(1): c.rstrip("\n") + "\n" for c in chunks}
+
+
+class TemplateGuardTests(unittest.TestCase):
+    """template.yaml keeps the member-role, naming, masking, alarm and bucket
+    hardening."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = _text("template.yaml")
+        cls.role = _yaml_block(cls.text, "  FunctionRole")
+        cls.stmts = _statements(cls.role)
+
+    def test_candidate_roles_parameter(self):
+        p = _yaml_block(self.text, "  CandidateRoles")
+        self.assertIn("\n    Default: OrgAccessKeyAuditRole\n", p)
+        # The grant is built from these names: wildcards and empty entries must fail.
+        pattern = re.search(r"AllowedPattern: '(.+)'", p).group(1)
+        for name in ("OrgAccessKeyAuditRole", "Custom.Audit-Role_1", "x" * 64):
+            self.assertRegex(name, pattern)
+        for name in ("*", "Org*", "", "x" * 65, "role/x", "a b"):
+            with self.subTest(name=name):
+                self.assertNotRegex(name, pattern)
+
+    def test_admin_fallback_is_opt_in(self):
+        p = _yaml_block(self.text, "  AllowAdminRoleFallback")
+        self.assertIn('\n    Default: "false"\n', p)
+        self.assertIn('AdminFallback: !Equals [!Ref AllowAdminRoleFallback, "true"]', self.text)
+        fn = _yaml_block(self.text, "  InventoryFunction")
+        self.assertIn("ALLOW_ADMIN_ROLE_FALLBACK: !Ref AllowAdminRoleFallback", fn)
+        self.assertIn('CANDIDATE_ROLES: !Join [",", !Ref CandidateRoles]', fn)
+
+    def test_assume_grant_follows_candidate_roles(self):
+        s = self.stmts["AssumeCandidateRoles"]
+        m = re.search(r'Resource: !Split\n\s+- ","\n\s+- !Join\n\s+- ""\n'
+                      r'\s+- - "(arn:aws:iam::\*:role/)"\n'
+                      r'\s+- !Join \["(,arn:aws:iam::\*:role/)", !Ref CandidateRoles\]\n', s)
+        self.assertIsNotNone(m, "AssumeCandidateRoles must build its ARNs from CandidateRoles")
+        prefix, sep = m.groups()
+
+        def render(names):  # Fn::Split(",", Fn::Join("", [prefix, Fn::Join(sep, names)]))
+            return (prefix + sep.join(names)).split(",")
+
+        self.assertEqual(render(["OrgAccessKeyAuditRole"]),
+                         ["arn:aws:iam::*:role/OrgAccessKeyAuditRole"])
+        self.assertEqual(render(["A", "B"]), ["arn:aws:iam::*:role/A", "arn:aws:iam::*:role/B"])
+        # A policy variable, not !Sub: inside a !Sub it would need ${!aws:PrincipalOrgID}.
+        self.assertNotIn("!Sub", s)
+
+    def test_every_assume_role_allow_is_org_scoped(self):
+        assume = {sid: s for sid, s in self.stmts.items() if "sts:AssumeRole" in s}
+        self.assertEqual(set(assume), {"AssumeCandidateRoles", "AssumeAdminFallbackRoles",
+                                       "DenyAdminRolesWithoutOptIn"})
+        for sid, s in assume.items():
+            if "Effect: Allow" in s:
+                with self.subTest(sid=sid):
+                    self.assertIn(ORG_SCOPE, s)
+                    self.assertNotRegex(s, r'Resource: "\*"|role/\*')
+
+    def test_admin_roles_denied_without_opt_in(self):
+        self.assertRegex(self.role, r"- !If\n\s+- AdminFallback\n\s+- Sid: AssumeAdminFallbackRoles\n")
+        allow, deny = self.stmts["AssumeAdminFallbackRoles"], self.stmts["DenyAdminRolesWithoutOptIn"]
+        self.assertLess(self.role.index(allow), self.role.index(deny))  # Allow if true, else Deny
+        self.assertIn("Effect: Deny", deny)
+        self.assertIn("Action: sts:AssumeRole", deny)
+        self.assertNotIn("Condition", deny)
+        for arn in ADMIN_ROLE_ARNS:
+            with self.subTest(arn=arn):
+                self.assertIn(f"- {arn}\n", allow)
+                self.assertIn(f"- {arn}\n", deny)
+                self.assertEqual(self.role.count(arn), 2)  # nowhere else in the role
+
+    def test_named_inventory_role(self):
+        self.assertIn('RoleName: !Sub "${AWS::StackName}-inventory-role"', self.role)
+
+    def test_member_read_actions_match_session_policy(self):
+        session = json.loads(lf._SESSION_POLICY)["Statement"][0]["Action"]
+        self.assertEqual(sorted(re.findall(r"- (iam:\w+)", self.stmts["ReadLocalIamKeys"])),
+                         sorted(session))
+
+    def test_mask_bounds(self):
+        for name in ("MaskHead", "MaskTail"):
+            with self.subTest(name=name):
+                p = _yaml_block(self.text, f"  {name}")
+                self.assertIn("\n    MinValue: 0\n", p)
+                self.assertIn("\n    MaxValue: 8\n", p)
+
+    def test_function_timeout_and_log_format(self):
+        fn = _yaml_block(self.text, "  InventoryFunction")
+        self.assertIn("\n      Timeout: 900\n", fn)
+        # The AdminActionRequired filter parses the plain-text line format.
+        self.assertRegex(fn, r"\n      LoggingConfig:\n        LogFormat: Text\n")
+
+    def test_function_error_alarm_always_created(self):
+        a = _yaml_block(self.text, "  FunctionErrorAlarm")
+        self.assertNotIn("\n    Condition:", a)
+        self.assertIn('AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], !Ref "AWS::NoValue"]', a)
+
+    def test_report_bucket_private_and_tls_only(self):
+        b = _yaml_block(self.text, "  ReportBucket")
+        for flag in ("BlockPublicAcls", "BlockPublicPolicy", "IgnorePublicAcls",
+                     "RestrictPublicBuckets"):
+            with self.subTest(flag=flag):
+                self.assertRegex(b, rf"\n\s+{flag}: true\n")
+        self.assertRegex(b, r"OwnershipControls:\n\s+Rules:\n\s+- ObjectOwnership: BucketOwnerEnforced\n")
+        pol = _yaml_block(self.text, "  ReportBucketPolicy")
+        self.assertIn("Bucket: !Ref ReportBucket", pol)
+        self.assertIn("Effect: Deny", pol)
+        self.assertNotIn("Effect: Allow", pol)
+        self.assertIn('Action: "s3:*"', pol)
+        self.assertRegex(pol, r'Bool:\n\s+aws:SecureTransport: "false"\n')
+        # The only "*" principal in the template is that Deny.
+        self.assertEqual(self.text.count('Principal: "*"'), 1)
+        self.assertIn('Principal: "*"', pol)
+
+    def test_dashboard_body_is_json(self):
+        dash = _yaml_block(self.text, "      DashboardBody")
+        body = textwrap.dedent(dash.split("\n", 1)[1])
+        widgets = json.loads(re.sub(r"\$\{[^}]+\}", "x", body))["widgets"]
+        by_title = {w["properties"].get("title"): w["properties"] for w in widgets}
+        bedrock = by_title["Bedrock API keys: current counts (latest run)"]["metrics"]
+        self.assertIn(["x", "BedrockKeysInactive"], bedrock)
+
+
+class MemberAuditRoleTemplateTests(unittest.TestCase):
+    """member-audit-role.yaml trusts only the inventory role and stays read-only."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = _text("member-audit-role.yaml")
+        cls.role = _yaml_block(cls.text, "  AuditRole")
+
+    def test_trusts_only_the_inventory_role_from_the_org(self):
+        self.assertEqual(self.role.count("Action: sts:AssumeRole"), 1)
+        self.assertIn('AWS: !Sub "arn:aws:iam::${TrustedAccountId}:root"', self.role)
+        m = re.search(r"\n( +)Condition:\n\1  StringEquals:\n\1    aws:PrincipalOrgID: !Ref OrgId\n"
+                      r"\1  ArnEquals:\n(?:\1    #.*\n)*\1    aws:PrincipalArn: (.+)\n", self.role)
+        self.assertIsNotNone(m, "trust needs aws:PrincipalOrgID AND aws:PrincipalArn")
+        self.assertEqual(m.group(2),
+                         '!Sub "arn:aws:iam::${TrustedAccountId}:role/${InventoryRoleName}"')
+
+    def test_read_only_actions(self):
+        policies = self.role.split("\n      Policies:\n", 1)[1]
+        session = json.loads(lf._SESSION_POLICY)["Statement"][0]["Action"]
+        self.assertEqual(sorted(re.findall(r"- (\w+:\w+)", policies)), sorted(session))
+
+    def test_inventory_role_name_matches_deploy_defaults(self):
+        stack = re.search(r'\nSTACK="\$\{3:-([\w-]+)\}"\n', _text("deploy.sh")).group(1)
+        stackset = _text("deploy-audit-role-stackset.sh")
+        self.assertIn(f'INVENTORY_STACK="${{4:-{stack}}}"', stackset)
+        self.assertIn('INVENTORY_ROLE_NAME="${INVENTORY_STACK}-inventory-role"', stackset)
+        p = _yaml_block(self.text, "  InventoryRoleName")
+        self.assertIn(f"\n    Default: {stack}-inventory-role\n", p)
+        self.assertIn("\n    AllowedPattern: '^[\\w+=,.@-]{1,64}$'\n", p)
+
+
+@unittest.skipUnless(BASH, "bash not installed")
+class ScriptGuardTests(unittest.TestCase):
+    """deploy/destroy scripts: text checks, plus AWS-free snippets cut out of
+    the scripts and run in bash with an `aws` on PATH that fails if called."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = {name: _text(name) for name in SCRIPTS}
+
+    def _snippet(self, name, pattern):
+        m = re.search(pattern, self.src[name], re.S)
+        self.assertIsNotNone(m, f"{name}: {pattern!r} not found")
+        return m.group(0)
+
+    def _bash(self, script, stdin="", env=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = pathlib.Path(tmp, "aws")
+            fake.write_text("#!/bin/sh\necho 'aws must not be called' >&2\nexit 97\n")
+            fake.chmod(0o755)
+            run_env = {"PATH": os.pathsep.join([tmp, "/usr/bin", "/bin"]), "HOME": tmp,
+                       "AWS_CONFIG_FILE": os.devnull, "AWS_SHARED_CREDENTIALS_FILE": os.devnull}
+            run_env.update(env or {})
+            return subprocess.run([BASH, "-c", script], input=stdin, env=run_env,
+                                  capture_output=True, text=True, timeout=30, check=False)
+
+    def test_syntax(self):
+        for name in SCRIPTS:
+            with self.subTest(name=name):
+                r = subprocess.run([BASH, "-n", str(REPO / name)], capture_output=True,
+                                   text=True, timeout=30, check=False)
+                self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_scripts_cd_to_their_folder(self):
+        for name, src in self.src.items():
+            with self.subTest(name=name):
+                code = [line for line in src.splitlines()
+                        if line.strip() and not line.lstrip().startswith("#")]
+                self.assertEqual(code[:2], ["set -euo pipefail", 'cd "$(dirname "$0")"'])
+
+    def test_deploy_artifact_bucket_owner_checked(self):
+        src = self.src["deploy.sh"]
+        self.assertIn('OWNER=(--expected-bucket-owner "$ACCOUNT_ID")', src)
+        calls = [line for line in src.splitlines() if "aws s3api " in line]
+        self.assertGreaterEqual(len(calls), 6)
+        for line in calls:
+            # CreateBucket has no expected-owner check; it fails if the name is taken.
+            if "create-bucket" not in line:
+                with self.subTest(line=line.strip()):
+                    self.assertIn('--bucket "$ARTIFACT_BUCKET" "${OWNER[@]}"', line)
+        heads = [m.start() for m in re.finditer(r"if ! aws s3api head-bucket ", src)]
+        self.assertEqual(len(heads), 2)
+        package = src.index("aws cloudformation package")
+        # The re-check right before the upload fails closed.
+        self.assertRegex(src[heads[1]:package], r"^[^\n]*; then\n\s+echo [^\n]*>&2\n\s+exit 1\nfi\n")
+        # Hardening runs on every deploy: after the create block, before the upload.
+        after_create = src.index("\nfi\n", heads[0])
+        for call in ("put-public-access-block", "put-bucket-ownership-controls",
+                     "put-bucket-versioning", "put-bucket-policy"):
+            with self.subTest(call=call):
+                self.assertLess(after_create, src.index(f"aws s3api {call} "))
+                self.assertLess(src.index(f"aws s3api {call} "), heads[1])
+        self.assertIn("BlockPublicAcls=true,BlockPublicPolicy=true,IgnorePublicAcls=true,"
+                      "RestrictPublicBuckets=true", src)
+        self.assertIn("'Rules=[{ObjectOwnership=BucketOwnerEnforced}]'", src)
+        self.assertIn("--versioning-configuration Status=Enabled", src)
+        policy = re.search(r'--policy "(.+)"\n', src).group(1)
+        policy = json.loads(policy.replace('\\"', '"').replace("$ARTIFACT_BUCKET", "b"))
+        (stmt,) = policy["Statement"]
+        self.assertEqual((stmt["Effect"], stmt["Principal"], stmt["Action"]), ("Deny", "*", "s3:*"))
+        self.assertEqual(stmt["Resource"], ["arn:aws:s3:::b", "arn:aws:s3:::b/*"])
+        self.assertEqual(stmt["Condition"], {"Bool": {"aws:SecureTransport": "false"}})
+
+    def test_deploy_named_iam_and_role_params(self):
+        src = self.src["deploy.sh"]
+        self.assertIn("--capabilities CAPABILITY_NAMED_IAM", src)
+        self.assertNotRegex(src, r"CAPABILITY_IAM\b")
+        self.assertIn('CANDIDATE_ROLES="${CANDIDATE_ROLES:-OrgAccessKeyAuditRole}"', src)
+        self.assertIn('ALLOW_ADMIN_ROLE_FALLBACK="${ALLOW_ADMIN_ROLE_FALLBACK:-false}"', src)
+        overrides = self._snippet("deploy.sh", r"OVERRIDES=\(.*?\)\n")
+        self.assertIn('CandidateRoles="$CANDIDATE_ROLES"', overrides)
+        self.assertIn('AllowAdminRoleFallback="$ALLOW_ADMIN_ROLE_FALLBACK"', overrides)
+
+    def test_deploy_removes_bytecode_before_packaging(self):
+        src = self.src["deploy.sh"]
+        self.assertLess(src.index("find lambda -type d -name __pycache__ -prune -exec rm -rf {} +"),
+                        src.index("aws cloudformation package"))
+
+    def test_deploy_rejects_long_stack_names_before_any_aws_call(self):
+        src = self.src["deploy.sh"]
+        check = self._snippet("deploy.sh", r'if \[ "\$\{#STACK\}" -gt 49 \]; then\n.*?\nfi\n')
+        self.assertLess(src.index(check), src.index("$(aws sts get-caller-identity"))
+        for length, ok in ((49, True), (50, False)):
+            with self.subTest(length=length):
+                r = self._bash(f'set -euo pipefail\nSTACK={"a" * length}\n{check}echo PROCEED\n')
+                self.assertEqual((r.returncode == 0, "PROCEED" in r.stdout), (ok, ok), r.stderr)
+                if not ok:
+                    self.assertIn("longer than 49 characters", r.stderr)
+
+    def test_stackset_passes_inventory_role_name(self):
+        name = "deploy-audit-role-stackset.sh"
+        for op in ("update-stack-set", "create-stack-set"):
+            with self.subTest(op=op):
+                call = self._snippet(name, rf"aws cloudformation {op} (?:[^\n]*\\\n)*[^\n]*\n")
+                self.assertIn('ParameterKey=InventoryRoleName,ParameterValue="$INVENTORY_ROLE_NAME"',
+                              call)
+
+    def test_destroy_requires_typed_name(self):
+        for name, assign, value, delete in (
+                ("destroy.sh", "STACK", "org-access-key-inventory",
+                 "aws cloudformation delete-stack "),
+                ("destroy-audit-role-stackset.sh", "STACKSET", "org-access-key-audit-role",
+                 "aws cloudformation delete-stack-instances ")):
+            src = self.src[name]
+            gate = self._snippet(name, r'if \[ "\$\{FORCE:-\}" != "1" \]; then\n.*?\nfi\n')
+            self.assertLess(src.index(gate), src.index(delete))
+            script = (f"set -euo pipefail\nPROFILE=p REGION=r ROOT_ID=r-exam {assign}={value}\n"
+                      f"{gate}echo PROCEED\n")
+            for stdin, env, proceeds in (("nope\n", {}, False), ("", {}, False),
+                                         (value + "\n", {}, True), ("", {"FORCE": "1"}, True),
+                                         ("nope\n", {"FORCE": "yes"}, False)):
+                with self.subTest(name=name, stdin=stdin, env=env):
+                    r = self._bash(script, stdin=stdin, env=env)
+                    self.assertEqual((r.returncode == 0, "PROCEED" in r.stdout),
+                                     (proceeds, proceeds), r.stderr)
+                    if not proceeds:
+                        self.assertIn("Aborted: nothing was deleted.", r.stderr)
+        stackset = self.src["destroy-audit-role-stackset.sh"]
+        # A missing StackSet still exits 0 without asking.
+        self.assertLess(stackset.index("not found -- nothing to do"),
+                        stackset.index('if [ "${FORCE:-}" != "1" ]'))
+
+    def test_stackset_destroy_stops_on_failed_operation(self):
+        name = "destroy-audit-role-stackset.sh"
+        case = self._snippet(name, r'case "\$STATUS" in\n.*?\n\s*esac\n')
+        self.assertLess(self.src[name].index(case),
+                        self.src[name].index("aws cloudformation delete-stack-set "))
+        script = ("set -euo pipefail\nPROFILE=p REGION=r STACKSET=s OP=op-1\n"
+                  f"for _ in 1; do\n{case}done\necho PROCEED\n")
+        for status, proceeds in (("SUCCEEDED", True), ("FAILED", False), ("STOPPED", False)):
+            with self.subTest(status=status):
+                r = self._bash(f"STATUS={status}\n{script}")
+                self.assertEqual((r.returncode == 0, "PROCEED" in r.stdout),
+                                 (proceeds, proceeds), r.stderr)
+                if not proceeds:
+                    self.assertIn("the StackSet was NOT deleted", r.stderr)
+                    self.assertIn("list-stack-set-operation-results", r.stderr)
+                    self.assertIn('--operation-id "op-1"', r.stderr)
 
 
 if __name__ == "__main__":

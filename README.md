@@ -17,6 +17,7 @@ account and writes the reports. It can run on a schedule and email you on errors
 - **`access-keys.csv`**: `run_id, account_id, account_name, user, access_key_id, status, create_date, age_days, last_used` (`last_used` is a timestamp, `Never`, or `Unknown` if the lookup failed).
 - **`bedrock-api-keys.csv`**: long-term Bedrock API keys with status, age, expiration date, days to expiry, and whether they never expire. Turn it off with `IncludeBedrockKeys=false`.
 - Key IDs are **masked** (e.g. `AKIA************MPLE`); secret keys are never touched.
+- Text cells starting with `=`, `+`, `-`, `@` (or tab/CR) get a leading `'`, so spreadsheets show them as text instead of running a formula.
 - **History**: each run records which keys were added, removed, activated, or deactivated since the previous run.
 - **CloudWatch metrics and a dashboard** for key counts, staleness, expiry, and changes over time.
 
@@ -50,12 +51,18 @@ REGION=us-east-1
 # one-time: allow StackSets to manage org accounts
 aws cloudformation activate-organizations-access --profile "$PROFILE"
 
-# 1) read-only audit role in every member account (always run this first)
+# 1) read-only audit role in every member account (first, for a new deployment)
 ./deploy-audit-role-stackset.sh "$PROFILE" "$REGION"
 
 # 2) the Lambda and S3 bucket
 ./deploy.sh "$PROFILE" "$REGION"
 ```
+
+Accounts without `OrgAccessKeyAuditRole` are reported as errors: the Lambda only
+falls back to the admin roles `OrganizationAccountAccessRole` /
+`AWSControlTowerExecution` if you deploy with `ALLOW_ADMIN_ROLE_FALLBACK=true`.
+Updating an existing deployment: run `deploy.sh` first, then the StackSet script
+([details](./README.detailed.md#deploy)).
 
 `deploy.sh` asks two optional questions:
 
@@ -127,16 +134,19 @@ as added. Set `PublishMetrics=false` to skip metrics and the dashboard.
 ./destroy-audit-role-stackset.sh "$PROFILE" "$REGION" # audit role in all accounts
 ```
 
+Both scripts ask you to type the stack/StackSet name (`FORCE=1` skips the prompt).
+
 ---
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `template.yaml` | Main stack: Lambda, role, S3, optional SNS/alarms/schedule/dashboard. |
+| `template.yaml` | Main stack: Lambda, role, S3, alarms, optional SNS/schedule/dashboard. |
 | `lambda/lambda_function.py` | The inventory handler. |
 | `deploy.sh` / `destroy.sh` | Deploy / remove the main stack. |
 | `member-audit-role.yaml` | Read-only role for member accounts. |
 | `deploy-audit-role-stackset.sh` / `destroy-audit-role-stackset.sh` | Deploy / remove that role org-wide. |
 | `tests/test_bedrock_keys.py` | Offline unit tests (`python3 -m unittest discover -s tests -v`). |
 | `README.detailed.md` | Full documentation. |
+| `SECURITY.md` | How to report a vulnerability privately. |

@@ -2,8 +2,13 @@
 # Remove the audit-role StackSet and its instances from every member account.
 # The org root ID is DISCOVERED at runtime -- no placeholder to fill in.
 #
+# You are asked to type the StackSet name to confirm (no input aborts). FORCE=1
+# skips the prompt. If deleting the instances ends FAILED or STOPPED, the
+# StackSet is kept and the script exits non-zero.
+#
 # Usage: ./destroy-audit-role-stackset.sh <mgmt-profile> [region]
 set -euo pipefail
+cd "$(dirname "$0")"
 
 PROFILE="${1:?usage: ./destroy-audit-role-stackset.sh <mgmt-profile> [region]}"
 REGION="${2:-us-east-1}"
@@ -21,6 +26,11 @@ if ! aws cloudformation describe-stack-set --stack-set-name "$STACKSET" \
   exit 0
 fi
 
+if [ "${FORCE:-}" != "1" ]; then
+  read -r -p "This removes the audit role from every member account under $ROOT_ID. Type '$STACKSET' to confirm: " CONFIRM || CONFIRM=""
+  [ "$CONFIRM" = "$STACKSET" ] || { echo "Aborted: nothing was deleted." >&2; exit 1; }
+fi
+
 echo ">> Deleting stack instances from all accounts under $ROOT_ID"
 OP=$(aws cloudformation delete-stack-instances --stack-set-name "$STACKSET" \
   --deployment-targets OrganizationalUnitIds="$ROOT_ID" --regions "$REGION" \
@@ -34,7 +44,14 @@ while : ; do
     --operation-id "$OP" --profile "$PROFILE" --region "$REGION" \
     --query "StackSetOperation.Status" --output text)
   echo "   $STATUS"
-  case "$STATUS" in SUCCEEDED|FAILED|STOPPED) break ;; esac
+  case "$STATUS" in
+    SUCCEEDED) break ;;
+    FAILED|STOPPED)
+      # Instances may remain, so deleting the StackSet now would just fail.
+      echo "!! Instance deletion ended with $STATUS; the StackSet was NOT deleted. Per-account details:" >&2
+      echo "   aws cloudformation list-stack-set-operation-results --stack-set-name \"$STACKSET\" --operation-id \"$OP\" --profile \"$PROFILE\" --region \"$REGION\"" >&2
+      exit 1 ;;
+  esac
   sleep 10
 done
 

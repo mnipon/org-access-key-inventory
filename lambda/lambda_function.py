@@ -75,8 +75,14 @@ Environment variables:
                                PREFIX/state/ is empty. Default
                                "access-key-reports"; empty disables it.
   CANDIDATE_ROLES  (optional)  comma-separated role names to try (in order) when
-                               assuming into a member account. Default:
-                               "OrgAccessKeyAuditRole,OrganizationAccountAccessRole,AWSControlTowerExecution"
+                               assuming into a member account. Default (also
+                               used when blank): "OrgAccessKeyAuditRole".
+  ALLOW_ADMIN_ROLE_FALLBACK (optional)  "true" to also try the admin roles
+                               OrganizationAccountAccessRole and
+                               AWSControlTowerExecution after CANDIDATE_ROLES.
+                               Default "false" (they are ignored even if listed).
+                               Every member-account session carries a read-only
+                               session policy and lasts 15 minutes.
   ALERT_TOPIC_ARN  (optional)  SNS topic ARN to notify when errors occur.
   METRIC_NAMESPACE (optional)  CloudWatch namespace for custom metrics.
                                Default "OrgAccessKeyInventory".
@@ -89,6 +95,10 @@ Environment variables:
   BEDROCK_EXPIRY_WARN_DAYS (optional)  An active Bedrock API key expiring within
                                this many days counts as "expiring soon".
                                Default 30.
+  MASK_HEAD / MASK_TAIL    (optional)  Leading/trailing characters of key and
+                               credential ids left visible (default 4/4; 0-8 via
+                               the stack, negatives count as 0). Both 0 shows
+                               the full id.
 """
 import csv
 import datetime as dt
@@ -108,8 +118,39 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 RETRY_CFG = Config(retries={"max_attempts": 10, "mode": "adaptive"})
-_DEFAULT_ROLES = "OrgAccessKeyAuditRole,OrganizationAccountAccessRole,AWSControlTowerExecution"
-CANDIDATE_ROLES = [r.strip() for r in os.environ.get("CANDIDATE_ROLES", _DEFAULT_ROLES).split(",") if r.strip()]
+_DEFAULT_ROLES = "OrgAccessKeyAuditRole"
+# Admin roles that trust the management account by default (AdministratorAccess).
+# Only tried -- and only granted in IAM -- when ALLOW_ADMIN_ROLE_FALLBACK=true.
+_ADMIN_FALLBACK_ROLES = ("OrganizationAccountAccessRole", "AWSControlTowerExecution")
+ALLOW_ADMIN_ROLE_FALLBACK = os.environ.get("ALLOW_ADMIN_ROLE_FALLBACK", "false").lower() == "true"
+# Inline session policy on every member-account session: whatever the assumed
+# role allows (even an opted-in admin role), the session can only make these
+# read-only calls. Effective permissions = role policy AND session policy.
+_SESSION_POLICY = json.dumps({"Version": "2012-10-17", "Statement": [{
+    "Effect": "Allow",
+    "Action": ["iam:ListUsers", "iam:ListAccessKeys", "iam:GetAccessKeyLastUsed",
+               "iam:ListServiceSpecificCredentials"],
+    "Resource": "*"}]}, separators=(",", ":"))
+_SESSION_SECONDS = 900  # STS minimum; every account gets a fresh session
+
+
+def _candidate_roles(raw, allow_admin):
+    """Member-account role names to try, in order -> (roles, ignored_admin_roles).
+
+    Blank entries are dropped and an empty result falls back to the default,
+    so a blank CANDIDATE_ROLES can't leave nothing to try. Admin roles are
+    dropped unless allow_admin, and appended after the candidates when it is.
+    """
+    names = [r.strip() for r in (raw or "").split(",") if r.strip()]
+    ignored = [] if allow_admin else [r for r in names if r in _ADMIN_FALLBACK_ROLES]
+    roles = [r for r in names if r not in ignored] or _DEFAULT_ROLES.split(",")
+    if allow_admin:
+        roles += [r for r in _ADMIN_FALLBACK_ROLES if r not in roles]
+    return roles, ignored
+
+
+CANDIDATE_ROLES, _IGNORED_ADMIN_ROLES = _candidate_roles(
+    os.environ.get("CANDIDATE_ROLES", _DEFAULT_ROLES), ALLOW_ADMIN_ROLE_FALLBACK)
 FIELDS = ["run_id", "account_id", "account_name", "user", "access_key_id",
           "status", "create_date", "age_days", "last_used"]
 # last_used values other than an ISO timestamp. "Unknown" is the shared
@@ -157,18 +198,30 @@ STATE_SCHEMA_VERSION = 2
 MANIFEST_VERSION = 1
 
 # Show only the first/last few characters of an access key id (e.g. keep 4 at
-# each end, mask the middle). Controlled by MASK_HEAD / MASK_TAIL env vars
-# (defaults 4/4); set both to 0 to disable masking.
-_MASK_HEAD = int(os.environ.get("MASK_HEAD", "4"))
-_MASK_TAIL = int(os.environ.get("MASK_TAIL", "4"))
+# each end, mask the middle). MASK_HEAD / MASK_TAIL (defaults 4/4) are clamped
+# to >= 0; both 0 is the documented opt-in to show the full id.
+def _nonneg_int_env(name, default):
+    """Integer env var clamped to >= 0 (a negative width must not reveal more)."""
+    return max(0, int(os.environ.get(name, str(default))))
+
+
+_MASK_HEAD = _nonneg_int_env("MASK_HEAD", 4)
+_MASK_TAIL = _nonneg_int_env("MASK_TAIL", 4)
 
 
 def _mask(kid):
+    """Mask the middle of an id, keeping _MASK_HEAD/_MASK_TAIL characters.
+
+    Unless both widths are 0 (show the full id), at least one character is
+    always masked: if head + tail would cover the whole id, mask all of it.
+    """
     if not kid or (_MASK_HEAD == 0 and _MASK_TAIL == 0):
         return kid
-    if len(kid) <= _MASK_HEAD + _MASK_TAIL:
-        return kid
-    return kid[:_MASK_HEAD] + "*" * (len(kid) - _MASK_HEAD - _MASK_TAIL) + kid[-_MASK_TAIL:]
+    hidden = len(kid) - _MASK_HEAD - _MASK_TAIL
+    if hidden <= 0:
+        return "*" * len(kid)
+    # kid[len(kid) - tail:], not kid[-tail:]: with tail 0 the latter is the whole id.
+    return kid[:_MASK_HEAD] + "*" * hidden + kid[len(kid) - _MASK_TAIL:]
 
 
 def _err_code(e):
@@ -313,11 +366,19 @@ def _annotate_bedrock_rows(b_rows, key_rows, account_id, account_name):
 
 
 def _member_iam(sts, session, account_id):
+    """IAM client in a member account via the first assumable CANDIDATE_ROLES name.
+
+    Every session is limited by _SESSION_POLICY (read-only IAM) and lasts
+    _SESSION_SECONDS. Returns (iam_client, role_name); raises the last
+    ClientError if no role could be assumed.
+    """
     last_err = None
     for role in CANDIDATE_ROLES:
         arn = f"arn:aws:iam::{account_id}:role/{role}"
         try:
-            c = sts.assume_role(RoleArn=arn, RoleSessionName="AccessKeyAudit")["Credentials"]
+            c = sts.assume_role(RoleArn=arn, RoleSessionName="AccessKeyAudit",
+                                Policy=_SESSION_POLICY,
+                                DurationSeconds=_SESSION_SECONDS)["Credentials"]
             return session.client("iam",
                                   aws_access_key_id=c["AccessKeyId"],
                                   aws_secret_access_key=c["SecretAccessKey"],
@@ -325,6 +386,11 @@ def _member_iam(sts, session, account_id):
                                   config=RETRY_CFG), role
         except ClientError as e:
             last_err = e
+    if last_err is None:
+        # Can't happen via _candidate_roles; fail this account (as a ClientError,
+        # so the handler records it), never the whole run.
+        raise ClientError({"Error": {"Code": "NoCandidateRoles",
+                                     "Message": "CANDIDATE_ROLES is empty"}}, "AssumeRole")
     raise last_err
 
 
@@ -483,7 +549,9 @@ def _put_object(s3, bucket, key, body, content_type, writes, label="", metadata=
 
 
 def _state_id(account_id, raw_key_id):
-    """Stable, non-reversible identifier for a key (no raw id is persisted)."""
+    """Stable pseudonymous identifier for a key: the raw id isn't stored, but
+    this is not a secret -- key ids encode their account, so anyone who can
+    read state/ can likely recover the raw id (protect state/ like the CSVs)."""
     return hashlib.sha256(f"{account_id}:{raw_key_id}".encode("utf-8")).hexdigest()
 
 
@@ -734,14 +802,25 @@ def _publish_metrics(metrics):
         logger.error("Failed to publish CloudWatch metrics: %s", e)
 
 
+# Leading characters that make Excel/Sheets treat a cell as a formula (CSV
+# injection). Account names and IAM user names can start with them.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value):
+    """Prefix ' to text cells that a spreadsheet would run as a formula."""
+    return "'" + value if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES) else value
+
+
 def _csv_bytes(rows, fields, run_id):
     """CSV with run_id filled in on every row, so a downloaded file (e.g. from
-    latest/) always says which run produced it."""
+    latest/) always says which run produced it. Text cells that look like a
+    formula get a leading ' (see _csv_safe); numbers are written as-is."""
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=fields)
     w.writeheader()
     for r in sorted(rows, key=lambda x: (x["account_id"], x["create_date"])):
-        w.writerow({k: (run_id if k == "run_id" else r[k]) for k in fields})
+        w.writerow({k: (run_id if k == "run_id" else _csv_safe(r[k])) for k in fields})
     return buf.getvalue().encode("utf-8")
 
 
@@ -820,6 +899,9 @@ def handler(event, context):
     keys = _layout(prefix, legacy_prefix, now)
     run_id = keys["run_id"]
     logger.info("SDK boto3=%s botocore=%s", boto3.__version__, botocore.__version__)
+    if _IGNORED_ADMIN_ROLES:
+        logger.warning("Ignoring %s in CANDIDATE_ROLES: admin roles are only tried when "
+                       "ALLOW_ADMIN_ROLE_FALLBACK=true", ", ".join(_IGNORED_ADMIN_ROLES))
 
     session = boto3.Session()
     mgmt_id = session.client("sts").get_caller_identity()["Account"]
