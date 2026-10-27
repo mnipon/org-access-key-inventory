@@ -13,3 +13,11 @@ __pycache__/
 
 # macOS
 .DS_Store
+.omni/
+.claude/
+.github/
+.cursor/
+.kiro/
+.agents/
+.env.omni
+.omni/collector.json
